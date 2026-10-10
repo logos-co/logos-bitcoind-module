@@ -1,0 +1,21 @@
+{
+  "name": "bitcoind_module",
+  "display_name": "Bitcoin Node (local)",
+  "version": "0.1.0",
+  "type": "core",
+  "interface": "universal",
+  "concurrency": "multi",
+  "category": "wallet",
+  "description": "Runs a Bitcoin node (Bitcoin Core) in-process and serves the wallet Core's RPC over Logos IPC: per-network config, start, stop, flush, status, rpc and log tail.",
+  "author": "Logos Core Team",
+  "main": "bitcoind_module_plugin",
+  "codegen": { "impl_header": "bitcoind_module_impl.h", "impl_class": "BitcoindModuleImpl" },
+  "dependencies": [],
+  "include": ["COPYING.bitcoin", "NOTICES.bitcoind_c"],
+  "capabilities": [],
+  "nix": {
+    "packages": { "build": [], "runtime": ["nlohmann_json"] },
+    "external_libraries": [ { "name": "bitcoind_c" } ],
+    "cmake": { "extra_include_dirs": ["lib"] }
+  }
+}
