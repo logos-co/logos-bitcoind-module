@@ -99,8 +99,32 @@ stop path's static `std::once_flag`s, and credentials and whitelists that only a
 ## Unloading
 
 On unload the node is stopped on a thread and the outcome is written to `unload.log` in the
-instance directory. The host waits up to its grace period; a node killed after that replays
-its unwritten blocks on the next start, since Core's chainstate is crash-safe.
+instance directory. The host waits up to its grace period (3 s); a node killed after that
+replays its unwritten blocks on the next start, since Core's chainstate is crash-safe.
+
+At the tip the final flush takes milliseconds. What can hold a stop up is Core's connection
+thread: over clearnet it may be inside a `connect()` wait of up to `-timeout` (5 s) when the stop
+arrives, and `Shutdown` joins it. Over Tor that wait is the SOCKS5 handshake, which Core
+interrupts on shutdown.
+
+## Verified, 2026-10-10
+
+In a real `logos_host` under logosctl, with HOME isolated:
+
+- **macOS** (aarch64, logosctl 0.3.2): the config refusals; regtest running 0.5–0.7 s after
+  `start`; every allowlisted method answers, named parameters included; the host is refused
+  without `callers.json`, `generatetodescriptor` and `stop` always; `stop` in 0.26–0.56 s,
+  restart running in 0.38–0.47 s, unload while running in 0.29–0.37 s (node stop 73–130 ms).
+  `exposeRpc`: an owner-only cookie, 200 for a whitelisted method, 403 for another, 401 for a
+  wrong or the previous start's cookie; the cookie is gone and the port closed after a stop.
+- **Windows** 10.0.26200 (the portable logosctl): regtest running in 0.27–0.40 s, `stop` in
+  0.09–0.19 s, restart in 0.22–0.41 s, unload while running in 0.19–0.24 s (node stop 72–127 ms).
+- **Signet**, synced from scratch over clearnet in about 40 minutes (325,817 blocks; pruned to
+  550 MiB, 481 MB on disk): unload during initial sync 665 ms; at the tip over Tor, five unloads
+  in 456–1357 ms; over clearnet four in 403–589 ms and one in 4.2 s, a connect in flight (see
+  Unloading), after which the next start replayed.
+- **testnet4** initial sync with `-debug=coindb`: the sync-time flush ran every three minutes
+  (440k coins written in 566 ms).
 
 ## Licence
 
