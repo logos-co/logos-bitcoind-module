@@ -268,6 +268,11 @@ StdLogosResult BitcoindModuleImpl::start(const std::string& network) {
         m_network = network;
         m_logFile = (dataDir / netSubdir(network) / "debug.log").string();
     }
+    {
+        std::lock_guard<std::mutex> lock(m_sampleMutex);
+        ++m_runGen;
+        m_chain = chainDefaults();
+    }
     if (BITCOIND_start(argv.dump().c_str()) != 0) {
         const std::string why = takeString(BITCOIND_last_error());
         refresh();
@@ -329,9 +334,14 @@ void BitcoindModuleImpl::pollLoop() {
     while (!m_pollStop) {
         lock.unlock();
         // Outside the emit lock: Core's RPC can wait on cs_main for seconds.
+        const uint64_t gen = m_runGen;
         json chain = chainDefaults();
         if (BITCOIND_state() == BITCOIND_RUNNING) chain = sampleChain();
-        { std::lock_guard<std::mutex> l(m_sampleMutex); m_chain = chain; }
+        {
+            // A sample that straddled a restart belongs to the last run.
+            std::lock_guard<std::mutex> l(m_sampleMutex);
+            if (gen == m_runGen) m_chain = chain;
+        }
         refresh();
         // Keep the cache small during initial sync, so a stop or unload has little to write.
         const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(

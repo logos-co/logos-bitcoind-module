@@ -98,6 +98,7 @@ private:
     std::condition_variable m_pollWake;
     std::mutex m_sampleMutex;
     nlohmann::json m_chain = nlohmann::json::object();   // guarded by m_sampleMutex; last chain sample
+    std::atomic<uint64_t> m_runGen{0};                   // bumped under m_sampleMutex at each start
     nlohmann::json m_sample = nlohmann::json::object();  // guarded by m_sampleMutex; what status() serves
     std::mutex m_emitMutex;                  // one merge-and-emit at a time, so events keep order
     std::string m_emittedState = "stopped";  // guarded by m_emitMutex
