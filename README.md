@@ -20,21 +20,22 @@ logosctl call bitcoind_module stop
 | `configure(network, config)` | Merges `config` into the stored settings; refuses unknown keys, wrong types and unknown networks |
 | `getConfig(network)`, `defaultConfig(network)` | The stored settings with defaults filled in; the defaults alone. Empty for an unknown network |
 | `start(network)` | Starts the node and returns once its thread runs |
-| `stop()` | Stops the node and waits for it |
+| `stop()` | Writes the UTXO cache (state `flushing`), then stops the node and waits for it |
 | `flush()` | Writes the UTXO cache to disk and keeps it in memory |
 | `status()` | Lifecycle and chain state; never waits on the node |
 | `rpc(method, paramsJson)` | One call into Core's RPC table, as a JSON string |
 | `logTail(lines)` | The last lines of the node's `debug.log` |
 
 Event: `bitcoindStateChanged(payloadJson)` on every lifecycle transition (`stopped`,
-`starting`, `running`, `stopping`, `failed`), with `status()`'s shape.
+`starting`, `running`, `flushing`, `stopping`, `failed`), with `status()`'s shape.
 
 Networks are `mainnet`, `testnet4`, `signet` and `regtest`.
 
 `status()` carries `state`, `network`, `version`, `uptimeSecs`, `lastError`, and from Core's
 RPC `blocks`, `headers`, `verificationProgress`, `initialSync`, `peersOut`, `pruneHeight`
 (0 on an unpruned node), `filterIndexHeight`, `tipAgeSecs` (the tip block's timestamp against
-the clock) and `sizeOnDisk`. Numbers are -1 until known and while the node is not running.
+the clock) and `sizeOnDisk`, and `dbcacheMiB`, the cache the node was started with (0 for
+Core's default). Numbers are -1 until known and while the node is not running.
 A thread samples the node every second, so `status()` never waits on Core's locks; `state`
 itself is read live.
 
@@ -54,6 +55,9 @@ Only `bitcoin_wallet_core_module` and `bitcoin_node_module` may call it (`-32600
 authorized, otherwise), and only for these methods (`-32601` otherwise): `getblockchaininfo`,
 `getblockhash`, `getblockheader`, `getblock`, `getblockfilter`, `getrawmempool`,
 `getmempoolentry`, `sendrawtransaction`, `estimatesmartfee`, `getnetworkinfo`, `getpeerinfo`.
+On regtest, for the wallet's end-to-end tests, the same callers may also mine with
+`generatetoaddress` and `generateblock`; they are refused on every other network, judged by the
+chain Core itself runs.
 
 The check reads the caller identity the host attaches to each call (`logos::currentCaller()`),
 not anything the caller sends. For tests, a `callers.json` in the instance directory replaces
@@ -69,11 +73,18 @@ Per network, persisted in the instance directory (`bitcoind.json`).
 |---|---|---|
 | `dataDir` | `<instance dir>/<network>` | Core's data directory; created owner-only |
 | `pruneMiB` | `2048` mainnet, `550` elsewhere | MiB of recent blocks kept; `0` keeps every block. Core's minimum is 550 |
-| `dbcacheMiB` | `0` | UTXO cache; `0` leaves Core's default for the machine's memory |
+| `dbcacheMiB` | `0` | UTXO cache during initial sync; `0` leaves Core's default for the machine's memory. See below |
 | `maxMempoolMiB` | `300` | |
 | `proxy` | `""` | Tor's SOCKS address. Set, it adds `-proxy`, `-onlynet=onion` and `-privatebroadcast` |
 | `logCategories` | `[]` | Core `-debug` categories, such as `["net","mempool"]` |
+| `addNodes` | `[]` | Up to 8 peers to keep a connection to, `host:port` (Core's `-addnode`), such as one's own node |
 | `exposeRpc` | `false` | Opens Core's RPC server on 127.0.0.1 for other programs; see below |
+
+A large cache makes initial sync fast but a stop slow and a desktop heavy, so once a run of a
+network has reached the tip (Core reports it out of initial sync), the module records it in
+`bitcoind-state.json` in the instance directory, and later starts of that network use 300 MiB,
+or `dbcacheMiB` when that is lower. A recorded tip more than a week old counts as catching up
+again, and gets the sync-time cache.
 
 Every start also passes `-blockfilterindex=1`, `-disablewallet`, `-persistmempool=0`,
 `-listen=0` and `-noconf`. Core refuses `-privatebroadcast` when neither Tor nor I2P is
@@ -102,10 +113,10 @@ On unload the node is stopped on a thread and the outcome is written to `unload.
 instance directory. The host waits up to its grace period (3 s); a node killed after that
 replays its unwritten blocks on the next start, since Core's chainstate is crash-safe.
 
-At the tip the final flush takes milliseconds. What can hold a stop up is Core's connection
-thread: over clearnet it may be inside a `connect()` wait of up to `-timeout` (5 s) when the stop
-arrives, and `Shutdown` joins it. Over Tor that wait is the SOCKS5 handshake, which Core
-interrupts on shutdown.
+At the tip the final flush takes milliseconds. What used to hold a stop up was Core's
+connection threads: a `connect()` in flight waited out `-timeout` (5 s) before `Shutdown` could
+join them. logos-bitcoin-core-nix's patch 0005 makes that wait interruptible, so a stop cuts it
+short; over Tor the wait is the SOCKS5 handshake, which Core already interrupts.
 
 ## Verified, 2026-10-10
 

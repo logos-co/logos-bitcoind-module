@@ -33,18 +33,18 @@ public:
     /// Start the node for `network`. Returns once its thread is running.
     StdLogosResult start(const std::string& network);
 
-    /// Stop the node and wait for it to shut down.
+    /// Write the cache (state "flushing"), then stop the node and wait for it to shut down.
     StdLogosResult stop();
 
     /// Write the node's UTXO cache to disk, keeping it in memory.
     StdLogosResult flush();
 
     /// @code{.json}
-    /// { "state": "stopped|starting|running|stopping|failed", "network": string,
+    /// { "state": "stopped|starting|running|flushing|stopping|failed", "network": string,
     ///   "version": string, "uptimeSecs": number, "lastError": string, "blocks": number,
     ///   "headers": number, "verificationProgress": number, "initialSync": bool,
     ///   "peersOut": number, "pruneHeight": number, "filterIndexHeight": number,
-    ///   "tipAgeSecs": number, "sizeOnDisk": number }
+    ///   "tipAgeSecs": number, "sizeOnDisk": number, "dbcacheMiB": number }
     /// @endcode
     /// Never waits on the node: a thread samples it every second and this serves the last
     /// sample. Numbers are -1 until known.
@@ -53,7 +53,8 @@ public:
     /// One call into Core's RPC table, in-process. `paramsJson` is a JSON array or object
     /// ("" for none). Returns Core's reply, {"result":...,"error":null} or
     /// {"result":null,"error":{"code":n,"message":s}}. Only bitcoin_wallet_core_module and
-    /// bitcoin_node_module may call it, and only for the allowlisted methods.
+    /// bitcoin_node_module may call it, and only for the allowlisted methods; on regtest also
+    /// generatetoaddress and generateblock.
     std::string rpc(const std::string& method, const std::string& paramsJson);
 
     /// The last `lines` lines of the node's debug.log.
@@ -71,7 +72,9 @@ private:
     bool knownNetwork(const std::string& network) const;
     nlohmann::json defaultsFor(const std::string& network) const;
     nlohmann::json settingsFor(const std::string& network);
-    nlohmann::json argvFor(const std::string& network, const nlohmann::json& s) const;
+    nlohmann::json argvFor(const std::string& network, const nlohmann::json& s, int64_t dbcacheMiB) const;
+    int64_t cacheFor(const std::string& network, int64_t configured) const;
+    void noteTip(int64_t tipAgeSecs);
     void persist();
     bool admitted();
     void loadCallers();
@@ -87,6 +90,9 @@ private:
     bool m_allowHost = false;                            // guarded by m_mutex
     std::string m_network;                               // guarded by m_mutex; the last start's
     std::string m_logFile;                               // guarded by m_mutex; the last start's
+    int64_t m_dbcacheMiB = 0;                            // guarded by m_mutex; the last start's, 0 = Core's
+    nlohmann::json m_state = nlohmann::json::object();   // guarded by m_mutex; bitcoind-state.json
+    std::atomic<bool> m_flushing{false};                 // stop() is writing the cache
 
     std::mutex m_lifecycleMutex;  // one start or stop at a time
 

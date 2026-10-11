@@ -23,8 +23,16 @@ const char* const kAllowedMethods[] = {
     "getnetworkinfo", "getpeerinfo",
 };
 
+// Mining for the wallet's end-to-end tests: the same callers, on regtest only.
+const char* const kRegtestMethods[] = {"generatetoaddress", "generateblock"};
+
 // During initial sync the cache is written this often, so a stop has little left to flush.
 constexpr auto kSyncFlushInterval = std::chrono::minutes(3);
+
+// Once a run has reached the tip, later starts use this cache (MiB) unless dbcacheMiB is lower.
+constexpr int64_t kAfterSyncCacheMiB = 300;
+// A tip older than this means the node is catching up again, so it gets the sync-time cache.
+constexpr int64_t kStaleTipSecs = 7 * 24 * 3600;
 
 std::string takeString(const char* s) {
     std::string out = s ? s : "";
@@ -95,6 +103,11 @@ void BitcoindModuleImpl::onContextReady() {
         m_config = json::parse(f, nullptr, false);
         if (!m_config.is_object()) m_config = json::object();
     }
+    std::ifstream sf(fs::path(m_persistDir) / "bitcoind-state.json");
+    if (sf) {
+        m_state = json::parse(sf, nullptr, false);
+        if (!m_state.is_object()) m_state = json::object();
+    }
     loadCallers();
 }
 
@@ -145,6 +158,8 @@ json BitcoindModuleImpl::defaultsFor(const std::string& network) const {
         {"proxy", ""},
         {"logCategories", json::array()},
         {"exposeRpc", false},
+        // Peers to keep a connection to, host:port (Core's -addnode), such as one's own node.
+        {"addNodes", json::array()},
     };
 }
 
@@ -196,12 +211,46 @@ StdLogosResult BitcoindModuleImpl::configure(const std::string& network, const L
                     return fail("logCategories holds names like \"net\" or \"mempool\"");
         if (k == "proxy" && v.get<std::string>().find_first_of(" \"") != std::string::npos)
             return fail("proxy must be host:port");
+        if (k == "addNodes") {
+            if (v.size() > 8) return fail("addNodes holds at most 8 peers");
+            for (const json& n : v)
+                if (n.get<std::string>().empty() || n.get<std::string>().find_first_of(" \",=") != std::string::npos)
+                    return fail("addNodes holds host:port entries");
+        }
     }
     json& stored = m_config[network];
     if (!stored.is_object()) stored = json::object();
     for (auto& [k, v] : config.items()) stored[k] = v;
     persist();
     return {true, settingsFor(network)};
+}
+
+// The sync-time cache until a run has reached the tip, then kAfterSyncCacheMiB unless lower.
+int64_t BitcoindModuleImpl::cacheFor(const std::string& network, int64_t configured) const {
+    const json n = m_state.contains(network) && m_state[network].is_object() ? m_state[network] : json::object();
+    const int64_t tipTime = n.value("tipTime", int64_t{0});
+    const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    if (!n.value("reachedTip", false) || now - tipTime > kStaleTipSecs) return configured;
+    return configured > 0 ? std::min(configured, kAfterSyncCacheMiB) : kAfterSyncCacheMiB;
+}
+
+// Called by the poller while the node is out of initial sync; writes only on news.
+void BitcoindModuleImpl::noteTip(int64_t tipAgeSecs) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_network.empty() || m_persistDir.empty()) return;
+    const int64_t tipTime = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count() - tipAgeSecs;
+    json& n = m_state[m_network];
+    if (!n.is_object()) n = json::object();
+    if (n.value("reachedTip", false) && tipTime - n.value("tipTime", int64_t{0}) < 3600) return;
+    n["reachedTip"] = true;
+    n["tipTime"] = tipTime;
+    const fs::path path = fs::path(m_persistDir) / "bitcoind-state.json";
+    const fs::path tmp = path.string() + ".tmp";
+    { std::ofstream f(tmp); f << m_state.dump(2); }
+    std::error_code ec;
+    fs::rename(tmp, path, ec);
 }
 
 void BitcoindModuleImpl::persist() {
@@ -214,7 +263,7 @@ void BitcoindModuleImpl::persist() {
 }
 
 // The plan's defaults: pruned with filters, no wallet, no listener, Tor only with a proxy.
-json BitcoindModuleImpl::argvFor(const std::string& network, const json& s) const {
+json BitcoindModuleImpl::argvFor(const std::string& network, const json& s, int64_t dbcacheMiB) const {
     json argv = json::array();
     if (network != "mainnet") argv.push_back("-" + network);
     argv.push_back("-datadir=" + s["dataDir"].get<std::string>());
@@ -225,7 +274,8 @@ json BitcoindModuleImpl::argvFor(const std::string& network, const json& s) cons
     argv.push_back("-disablewallet");
     argv.push_back("-persistmempool=0");
     argv.push_back("-listen=0");
-    if (s["dbcacheMiB"].get<int64_t>() > 0) argv.push_back("-dbcache=" + std::to_string(s["dbcacheMiB"].get<int64_t>()));
+    if (dbcacheMiB > 0) argv.push_back("-dbcache=" + std::to_string(dbcacheMiB));
+    for (const json& n : s["addNodes"]) argv.push_back("-addnode=" + n.get<std::string>());
     argv.push_back("-maxmempool=" + std::to_string(s["maxMempoolMiB"].get<int64_t>()));
     for (const json& c : s["logCategories"]) argv.push_back("-debug=" + c.get<std::string>());
     const std::string proxy = s["proxy"].get<std::string>();
@@ -264,8 +314,10 @@ StdLogosResult BitcoindModuleImpl::start(const std::string& network) {
         if (ec) return fail("dataDir: " + ec.message());
         // The chain is nobody else's business, and debug.log can name our peers.
         fs::permissions(dataDir, fs::perms::owner_all, fs::perm_options::replace, ec);
-        argv = argvFor(network, s);
+        const int64_t cache = cacheFor(network, s["dbcacheMiB"].get<int64_t>());
+        argv = argvFor(network, s, cache);
         m_network = network;
+        m_dbcacheMiB = cache;
         m_logFile = (dataDir / netSubdir(network) / "debug.log").string();
     }
     {
@@ -284,8 +336,15 @@ StdLogosResult BitcoindModuleImpl::start(const std::string& network) {
     return {true, status()};
 }
 
+// Writes the cache while the node still runs, so the flush shows as its own state.
 StdLogosResult BitcoindModuleImpl::stop() {
     std::lock_guard<std::mutex> lifecycle(m_lifecycleMutex);
+    if (BITCOIND_state() == BITCOIND_RUNNING) {
+        m_flushing = true;
+        refresh("flushing");
+        BITCOIND_flush();
+        m_flushing = false;
+    }
     const int st = BITCOIND_state();
     if (st == BITCOIND_RUNNING || st == BITCOIND_STARTING) refresh("stopping");
     BITCOIND_stop();
@@ -337,11 +396,16 @@ void BitcoindModuleImpl::pollLoop() {
         const uint64_t gen = m_runGen;
         json chain = chainDefaults();
         if (BITCOIND_state() == BITCOIND_RUNNING) chain = sampleChain();
+        bool current = false;
         {
             // A sample that straddled a restart belongs to the last run.
             std::lock_guard<std::mutex> l(m_sampleMutex);
-            if (gen == m_runGen) m_chain = chain;
+            current = gen == m_runGen;
+            if (current) m_chain = chain;
         }
+        if (current && chain["initialSync"] == false && chain["blocks"].get<int64_t>() > 0
+            && chain["tipAgeSecs"].get<int64_t>() >= 0)
+            noteTip(chain["tipAgeSecs"].get<int64_t>());
         refresh();
         // Keep the cache small during initial sync, so a stop or unload has little to write.
         const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -395,11 +459,13 @@ void BitcoindModuleImpl::refresh(const char* forceState) {
     if (st["state"] != "running" || forceState || !s.is_object()) s = chainDefaults();
     std::string network;
     { std::lock_guard<std::mutex> lock(m_mutex); network = m_network; }
-    s["state"] = forceState ? std::string(forceState) : st["state"].get<std::string>();
+    s["state"] = forceState ? std::string(forceState)
+               : (m_flushing && st["state"] == "running") ? std::string("flushing") : st["state"].get<std::string>();
     s["network"] = network;
     s["version"] = st.value("version", "");
     s["uptimeSecs"] = st.value("uptimeSecs", 0);
     s["lastError"] = st.value("lastError", "");
+    { std::lock_guard<std::mutex> lock(m_mutex); s["dbcacheMiB"] = m_dbcacheMiB; }
     if (!forceState) {
         std::lock_guard<std::mutex> lock(m_sampleMutex);
         m_sample = s;
@@ -422,7 +488,7 @@ LogosMap BitcoindModuleImpl::status() {
     }
     // An atomic read: the state is never a second stale, even when the rest is.
     const int state = BITCOIND_state();
-    st["state"] = stateName(state);
+    st["state"] = m_flushing && state == BITCOIND_RUNNING ? "flushing" : stateName(state);
     if (state != BITCOIND_RUNNING) {
         for (auto& [k, v] : chainDefaults().items()) st[k] = v;
     }
@@ -441,8 +507,14 @@ std::string BitcoindModuleImpl::rpc(const std::string& method, const std::string
     // Codes from JSON-RPC 2.0: an invalid request, and a method that is not there for us.
     if (!admitted()) return rpcRefusal(-32600, "not authorized");
     if (m_unloading) return rpcRefusal(-9, "unloading");
-    if (std::find(std::begin(kAllowedMethods), std::end(kAllowedMethods), method) == std::end(kAllowedMethods))
-        return rpcRefusal(-32601, "method not allowed: " + method);
+    if (std::find(std::begin(kAllowedMethods), std::end(kAllowedMethods), method) == std::end(kAllowedMethods)) {
+        if (std::find(std::begin(kRegtestMethods), std::end(kRegtestMethods), method) == std::end(kRegtestMethods))
+            return rpcRefusal(-32601, "method not allowed: " + method);
+        // The chain Core itself runs, not the network the module was last asked for.
+        const json st = json::parse(takeString(BITCOIND_status_json()), nullptr, false);
+        if (!st.is_object() || st.value("network", "") != "regtest")
+            return rpcRefusal(-32601, method + " is allowed on regtest only");
+    }
     return takeString(BITCOIND_rpc(method.c_str(), paramsJson.empty() ? nullptr : paramsJson.c_str()));
 }
 
