@@ -131,9 +131,14 @@ In a real `logos_host` under logosctl, with HOME isolated:
 - **Windows** 10.0.26200 (the portable logosctl): regtest running in 0.27–0.40 s, `stop` in
   0.09–0.19 s, restart in 0.22–0.41 s, unload while running in 0.19–0.24 s (node stop 72–127 ms).
 - **Signet**, synced from scratch over clearnet in about 40 minutes (325,817 blocks; pruned to
-  550 MiB, 481 MB on disk): unload during initial sync 665 ms; at the tip over Tor, five unloads
-  in 456–1357 ms; over clearnet four in 403–589 ms and one in 4.2 s, a connect in flight (see
-  Unloading), after which the next start replayed.
+  550 MiB, 481 MB on disk): unload during initial sync 665 ms. At the tip, before patch 0005:
+  over Tor five unloads in 456–1357 ms, over clearnet four in 403–589 ms and one in 4.2 s, a
+  connect in flight. With it: ten clearnet unloads with eight blackholed `addNodes`, one or two
+  of their connects interrupted at each shutdown, in 488–642 ms (node stop 284–433 ms), and five
+  over Tor in 570–1354 ms.
+- **Regtest mining**: `generatetoaddress` (101 blocks) and `generateblock` through `rpc()`,
+  refused on signet; `stop()` emits `flushing`, `stopping`, `stopped`; after the run that
+  reached the tip, the next starts passed `-dbcache=300`.
 - **testnet4** initial sync with `-debug=coindb`: the sync-time flush ran every three minutes
   (440k coins written in 566 ms).
 
