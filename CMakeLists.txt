@@ -18,6 +18,7 @@ logos_module(
         src/bitcoind_module_impl.h
         src/bitcoind_module_impl.cpp
         src/rpc_allowlist.h
+        src/bitcoind_argv.h
     EXTERNAL_LIBS
         bitcoind_c
     INCLUDE_DIRS

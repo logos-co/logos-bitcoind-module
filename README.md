@@ -95,6 +95,48 @@ Every start also passes `-blockfilterindex=1`, `-disablewallet`, `-persistmempoo
 `-listen=0` and `-noconf`. Core refuses `-privatebroadcast` when neither Tor nor I2P is
 reachable, so without a proxy (clearnet, or regtest) the node broadcasts the ordinary way.
 
+## Private broadcast
+
+With a proxy, the node runs with `-privatebroadcast` (and `-proxy`, `-onlynet=onion`). What Bitcoin
+Core 31.1 does with it, from its source at the v31.1 tag (9be056a):
+
+- `sendrawtransaction` leaves the transaction out of the node's mempool and hands it to private
+  broadcast (`rpc/mempool.cpp:125`, `node/transaction.cpp:105`). Core's own wallet is not
+  covered (`-privatebroadcast`'s help, `init.cpp:687`); the module runs with `-disablewallet`.
+- Each transaction gets 3 new connections (`NUM_PRIVATE_BROADCAST_PER_TX`,
+  `net_processing.cpp:201`, `:2272`), each to a random address of a reachable privacy network:
+  onion services, IPv4 or IPv6 through Tor's proxy when those are reachable, or I2P
+  (`net.cpp:3087`). With `-onlynet=onion` only onion services are reachable, so all three go to
+  onion services through the proxy, each on its own circuit (`-proxyrandomize`, on by default;
+  Core warns when it is off, `init.cpp:2277`).
+- On such a connection the version message says nothing of the node: services 0, time 0, height
+  0, no relay, empty addresses, and a fixed user agent, `/pynode:0.0.1/`, not Core's
+  (`net_processing.cpp:1557`). The peer gets `inv`, then the transaction when it asks, and the
+  connection closes; none lasts more than 3 minutes (`net_processing.cpp:203`, `:5743`).
+- The node's existing connections are not told while the broadcast is private: the transaction
+  isn't in the mempool, so nothing announces it. Once the node hears it back from the network it
+  stops the private attempts (`net_processing.cpp:4495`) and relays it as any transaction.
+- A transaction not heard back in time goes out privately again (`net_processing.cpp:1657`).
+- Core refuses to start with `-privatebroadcast` when neither Tor nor I2P is reachable, or with
+  `-connect` (`init.cpp:2261`). The 31.1 release notes fix a leak in 31.0, where some of these
+  connections were made over clearnet instead of the privacy network (#35410, the proxy kept on a
+  v2-to-v1 reconnect), and stop them from changing addrman (#35032).
+
+So the three receiving onion peers learn the transaction, and none of the node's own peers
+hears it from the node first; nothing in the feature hides that a transaction was broadcast from
+some Tor user, or protects a transaction sent another way.
+
+`tests/private_broadcast_test.py` checks it with the module's own flags (`tests/print_argv` prints
+them), Core 31.1 in-process through libbitcoind_c, under Core's own test framework, as Core's
+`p2p_private_broadcast.py` does: a SOCKS5 proxy routes the first private broadcast connection to a
+second regtest node and every other connection to a Python peer that records what it hears, the
+`-addnode` peer included (BIP324 or v1, as the node opens). The transaction stays out of the
+mempool and reaches the second node; the other two private connections each get the bare version,
+`inv` and the transaction, then close; none of the 11 to 13 existing connections (manual,
+outbound full relay, block relay only, feeler) hears of it. A control run without
+`-privatebroadcast` tells the existing peer. `nix build .#checks.<system>.private-broadcast` runs
+it (about a minute).
+
 ## Exposing the node to other programs
 
 `exposeRpc` is an opt-in for other consumers on the machine, such as `bitcoin-cli` or a block
@@ -166,4 +208,5 @@ of LevelDB, secp256k1, crc32c, minisketch and libevent as `NOTICES.bitcoind_c`.
 ```bash
 nix build .#install    # result/modules/bitcoind_module: the plugin and libbitcoind_c
 nix build .#checks.aarch64-darwin.rpc-allowlist   # rpc()'s allowlist, on its own
+nix build .#checks.aarch64-darwin.private-broadcast   # private broadcast with the module's flags
 ```

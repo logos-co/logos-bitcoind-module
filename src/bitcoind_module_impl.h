@@ -72,7 +72,6 @@ private:
     bool knownNetwork(const std::string& network) const;
     nlohmann::json defaultsFor(const std::string& network) const;
     nlohmann::json settingsFor(const std::string& network);
-    nlohmann::json argvFor(const std::string& network, const nlohmann::json& s, int64_t dbcacheMiB) const;
     int64_t cacheFor(const std::string& network, int64_t configured) const;
     void noteTip(int64_t tipAgeSecs);
     void persist();

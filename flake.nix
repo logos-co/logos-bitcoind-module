@@ -27,14 +27,27 @@
     in
     {
       packages = lib.genAttrs systems (system: module.packages.${system});
-      # rpc()'s allowlist, compiled and run on its own.
+      # rpc()'s allowlist, compiled and run on its own; and private broadcast with the module's
+      # flags, Core 31.1 in-process through libbitcoind_c, under Core's own test framework.
       checks = lib.genAttrs (lib.remove "x86_64-windows" systems) (system:
-        let pkgs = logos-module-builder.inputs.nixpkgs.legacyPackages.${system}; in {
+        let
+          pkgs = logos-module-builder.inputs.nixpkgs.legacyPackages.${system};
+          core = logos-bitcoin-core-nix.packages.${system};
+        in {
           rpc-allowlist = pkgs.runCommandCC "bitcoind-module-rpc-allowlist" { } ''
             cp -r ${./src} src
             cp -r ${./tests} tests
             $CXX -std=c++17 -Wall -Wextra -Werror -o allowlist tests/rpc_allowlist_test.cpp
             ./allowlist > $out
+          '';
+          private-broadcast = pkgs.runCommandCC "bitcoind-module-private-broadcast" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+            cp -r ${./src} src
+            cp -r ${./tests} tests
+            $CXX -std=c++17 -Wall -Wextra -Werror -I${pkgs.nlohmann_json}/include -o print_argv tests/print_argv.cpp
+            mkdir work
+            python3 tests/private_broadcast_test.py --lib ${core.libbitcoind_c}/lib/libbitcoind_c${pkgs.stdenv.hostPlatform.extensions.sharedLibrary} \
+              --framework ${core.bitcoin-core-src}/test/functional --print-argv ./print_argv --work $PWD/work > $out
+            cat $out
           '';
         });
     };
