@@ -146,6 +146,15 @@ In a real `logos_host` under logosctl, with HOME isolated:
   reached the tip, the next starts passed `-dbcache=300`.
 - **testnet4** initial sync with `-debug=coindb`: the sync-time flush ran every three minutes
   (440k coins written in 566 ms).
+- **Windows, 2026-10-11** (logosctl's portable bundle, the module cross-built from this tree):
+  in one `logos_host`, regtest running in 0.27 s and stopped in 94 ms; signet through a local Tor
+  running in 0.24 s, at an onion peer after 27 s, stopped in 234 ms; regtest again with its 101
+  blocks. 20 of 20 unloads at the tip within 2 s (median 151 ms, max 954 ms, node stop 33–133 ms),
+  half of them with eight blackholed `addNodes` connecting. The wallet core's local-node route
+  passed there too. `status()` used to iterate a temporary that C++17 had already destroyed:
+  while the node was stopped or starting, the Windows host died (0xc0000005) in 3 of about 90
+  loads that called `configure` and `status` in their first second, Linux in none of 40. Fixed,
+  0 of 60 since.
 
 ## Licence
 
