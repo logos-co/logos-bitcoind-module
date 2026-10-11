@@ -480,9 +480,9 @@ LogosMap BitcoindModuleImpl::status() {
     // An atomic read: the state is never a second stale, even when the rest is.
     const int state = BITCOIND_state();
     st["state"] = m_flushing && state == BITCOIND_RUNNING ? "flushing" : stateName(state);
-    if (state != BITCOIND_RUNNING) {
-        for (auto& [k, v] : chainDefaults().items()) st[k] = v;
-    }
+    // Not a range-for over chainDefaults().items(): C++17 destroys that temporary before the
+    // loop runs, and Windows' heap crashed the host on it while the node was stopped.
+    if (state != BITCOIND_RUNNING) st.update(chainDefaults());
     return st;
 }
 
