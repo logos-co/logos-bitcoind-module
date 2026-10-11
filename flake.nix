@@ -27,5 +27,15 @@
     in
     {
       packages = lib.genAttrs systems (system: module.packages.${system});
+      # rpc()'s allowlist, compiled and run on its own.
+      checks = lib.genAttrs (lib.remove "x86_64-windows" systems) (system:
+        let pkgs = logos-module-builder.inputs.nixpkgs.legacyPackages.${system}; in {
+          rpc-allowlist = pkgs.runCommandCC "bitcoind-module-rpc-allowlist" { } ''
+            cp -r ${./src} src
+            cp -r ${./tests} tests
+            $CXX -std=c++17 -Wall -Wextra -Werror -o allowlist tests/rpc_allowlist_test.cpp
+            ./allowlist > $out
+          '';
+        });
     };
 }

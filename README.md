@@ -52,9 +52,14 @@ or object, or `""` for none. The answer is Core's reply, `{"result":…,"error":
 `-28` (in warmup) with its init message, and `-9` when the node is not running.
 
 Only `bitcoin_wallet_core_module` and `bitcoin_node_module` may call it (`-32600`, not
-authorized, otherwise), and only for these methods (`-32601` otherwise): `getblockchaininfo`,
-`getblockhash`, `getblockheader`, `getblock`, `getblockfilter`, `getrawmempool`,
-`getmempoolentry`, `sendrawtransaction`, `estimatesmartfee`, `getnetworkinfo`, `getpeerinfo`.
+authorized, otherwise), and only for these methods (`-32601` otherwise; `src/rpc_allowlist.h`):
+`getblockchaininfo`, `getblockcount`, `getblockhash`, `getblockheader`, `getblock`,
+`getblockfilter`, `getblockfrompeer`, `getrawmempool`, `getmempoolentry`, `getrawtransaction`,
+`sendrawtransaction`, `estimatesmartfee`, `getnetworkinfo`, `getpeerinfo`. The wallet core's
+filter restore reads `getblockfilter` and fetches a pruned block it needs with
+`getblockfrompeer`, which asks one of the node's own peers: those connections follow the node's
+proxy setting (`-proxy`, `-onlynet=onion`), so nothing leaves outside it. `getrawtransaction`
+serves the mempool's transactions, and a block's with its hash.
 On regtest, for the wallet's end-to-end tests, the same callers may also mine with
 `generatetoaddress` and `generateblock`; they are refused on every other network, judged by the
 chain Core itself runs.
@@ -151,4 +156,5 @@ of LevelDB, secp256k1, crc32c, minisketch and libevent as `NOTICES.bitcoind_c`.
 
 ```bash
 nix build .#install    # result/modules/bitcoind_module: the plugin and libbitcoind_c
+nix build .#checks.aarch64-darwin.rpc-allowlist   # rpc()'s allowlist, on its own
 ```

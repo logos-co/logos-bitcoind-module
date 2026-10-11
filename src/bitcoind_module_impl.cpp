@@ -8,6 +8,7 @@
 #include <logos_caller.h>
 
 #include "bitcoind_c.h"
+#include "rpc_allowlist.h"
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -15,16 +16,6 @@ namespace fs = std::filesystem;
 namespace {
 
 const char* const kDefaultCallers[] = {"bitcoin_wallet_core_module", "bitcoin_node_module"};
-
-// What the wallet core and node module need; nothing that changes the node or reads its disk.
-const char* const kAllowedMethods[] = {
-    "getblockchaininfo", "getblockhash", "getblockheader", "getblock", "getblockfilter",
-    "getrawmempool", "getmempoolentry", "sendrawtransaction", "estimatesmartfee",
-    "getnetworkinfo", "getpeerinfo",
-};
-
-// Mining for the wallet's end-to-end tests: the same callers, on regtest only.
-const char* const kRegtestMethods[] = {"generatetoaddress", "generateblock"};
 
 // During initial sync the cache is written this often, so a stop has little left to flush.
 constexpr auto kSyncFlushInterval = std::chrono::minutes(3);
@@ -288,7 +279,7 @@ json BitcoindModuleImpl::argvFor(const std::string& network, const json& s, int6
     if (s["exposeRpc"].get<bool>()) {
         // Loopback only, a cookie Core writes afresh at each start, and the same methods as rpc().
         std::string methods;
-        for (const char* m : kAllowedMethods) methods += (methods.empty() ? "" : ",") + std::string(m);
+        for (const char* m : bitcoind_rpc::kAllowed) methods += (methods.empty() ? "" : ",") + std::string(m);
         argv.push_back("-server=1");
         argv.push_back("-rpcbind=127.0.0.1");
         argv.push_back("-rpcallowip=127.0.0.1");
@@ -507,8 +498,9 @@ std::string BitcoindModuleImpl::rpc(const std::string& method, const std::string
     // Codes from JSON-RPC 2.0: an invalid request, and a method that is not there for us.
     if (!admitted()) return rpcRefusal(-32600, "not authorized");
     if (m_unloading) return rpcRefusal(-9, "unloading");
-    if (std::find(std::begin(kAllowedMethods), std::end(kAllowedMethods), method) == std::end(kAllowedMethods)) {
-        if (std::find(std::begin(kRegtestMethods), std::end(kRegtestMethods), method) == std::end(kRegtestMethods))
+    const bitcoind_rpc::Verdict verdict = bitcoind_rpc::classify(method);
+    if (verdict != bitcoind_rpc::Verdict::Allowed) {
+        if (verdict == bitcoind_rpc::Verdict::Refused)
             return rpcRefusal(-32601, "method not allowed: " + method);
         // The chain Core itself runs, not the network the module was last asked for.
         const json st = json::parse(takeString(BITCOIND_status_json()), nullptr, false);
