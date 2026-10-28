@@ -28,7 +28,7 @@
     {
       packages = lib.genAttrs systems (system: module.packages.${system});
       # rpc()'s allowlist, compiled and run on its own; and private broadcast with the module's
-      # flags, Core 31.1 in-process through libbitcoind_c, under Core's own test framework.
+      # flags, Core 31.2 in-process through libbitcoind_c, under Core's own test framework.
       checks = lib.genAttrs (lib.remove "x86_64-windows" systems) (system:
         let
           pkgs = logos-module-builder.inputs.nixpkgs.legacyPackages.${system};

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Private broadcast with bitcoind_module's own flags for a proxy (tests/print_argv): Core 31.1
+"""Private broadcast with bitcoind_module's own flags for a proxy (tests/print_argv): Core 31.2
 in-process through libbitcoind_c, under Core's test framework as p2p_private_broadcast.py does. A
 SOCKS5 proxy sends the first private broadcast connection to a second regtest node and every other
 connection to a recording peer, the -addnode included. README, "Private broadcast".

@@ -1,7 +1,7 @@
 # logos-bitcoind-module
 
 `bitcoind_module` runs a Bitcoin full node, [Bitcoin Core](https://github.com/bitcoin/bitcoin)
-31.1, **in-process**, through `libbitcoind_c` from `logos-bitcoin-core-nix`. No executable is
+31.2, **in-process**, through `libbitcoind_c` from `logos-bitcoin-core-nix`. No executable is
 bundled and no subprocess is spawned: the node lives and dies with this module. The Bitcoin
 wallet reaches it over Logos IPC, through `rpc()`, rather than through a port.
 
@@ -98,27 +98,29 @@ reachable, so without a proxy (clearnet, or regtest) the node broadcasts the ord
 ## Private broadcast
 
 With a proxy, the node runs with `-privatebroadcast` (and `-proxy`, `-onlynet=onion`). What Bitcoin
-Core 31.1 does with it, from its source at the v31.1 tag (9be056a):
+Core 31.2 does with it, from its source at the v31.2 tag (241537a):
 
 - `sendrawtransaction` leaves the transaction out of the node's mempool and hands it to private
-  broadcast (`rpc/mempool.cpp:125`, `node/transaction.cpp:105`). Core's own wallet is not
+  broadcast (`rpc/mempool.cpp:130`, `node/transaction.cpp:105`). Core's own wallet is not
   covered (`-privatebroadcast`'s help, `init.cpp:687`); the module runs with `-disablewallet`.
 - Each transaction gets 3 new connections (`NUM_PRIVATE_BROADCAST_PER_TX`,
-  `net_processing.cpp:201`, `:2272`), each to a random address of a reachable privacy network:
+  `net_processing.cpp:201`, `:2275`), each to a random address of a reachable privacy network:
   onion services, IPv4 or IPv6 through Tor's proxy when those are reachable, or I2P
-  (`net.cpp:3087`). With `-onlynet=onion` only onion services are reachable, so all three go to
+  (`net.cpp:3102`). With `-onlynet=onion` only onion services are reachable, so all three go to
   onion services through the proxy, each on its own circuit (`-proxyrandomize`, on by default;
-  Core warns when it is off, `init.cpp:2277`).
+  Core warns when it is off, `init.cpp:2280`).
 - On such a connection the version message says nothing of the node: services 0, time 0, height
   0, no relay, empty addresses, and a fixed user agent, `/pynode:0.0.1/`, not Core's
   (`net_processing.cpp:1557`). The peer gets `inv`, then the transaction when it asks, and the
-  connection closes; none lasts more than 3 minutes (`net_processing.cpp:203`, `:5743`).
+  connection closes; none lasts more than 3 minutes (`net_processing.cpp:203`, `:5758`).
 - The node's existing connections are not told while the broadcast is private: the transaction
   isn't in the mempool, so nothing announces it. Once the node hears it back from the network it
-  stops the private attempts (`net_processing.cpp:4495`) and relays it as any transaction.
-- A transaction not heard back in time goes out privately again (`net_processing.cpp:1657`).
+  stops the private attempts (`net_processing.cpp:4504`) and relays it as any transaction.
+- A transaction not heard back in time goes out privately again (`net_processing.cpp:1658`).
+- At most 10,000 transactions wait to be heard back; past that, new ones are refused
+  (`private_broadcast.h:44`, `net_processing.cpp:2282`, new in 31.2).
 - Core refuses to start with `-privatebroadcast` when neither Tor nor I2P is reachable, or with
-  `-connect` (`init.cpp:2261`). The 31.1 release notes fix a leak in 31.0, where some of these
+  `-connect` (`init.cpp:2264`). The 31.1 release notes fix a leak in 31.0, where some of these
   connections were made over clearnet instead of the privacy network (#35410, the proxy kept on a
   v2-to-v1 reconnect), and stop them from changing addrman (#35032).
 
@@ -127,7 +129,7 @@ hears it from the node first; nothing in the feature hides that a transaction wa
 some Tor user, or protects a transaction sent another way.
 
 `tests/private_broadcast_test.py` checks it with the module's own flags (`tests/print_argv` prints
-them), Core 31.1 in-process through libbitcoind_c, under Core's own test framework, as Core's
+them), Core 31.2 in-process through libbitcoind_c, under Core's own test framework, as Core's
 `p2p_private_broadcast.py` does: a SOCKS5 proxy routes the first private broadcast connection to a
 second regtest node and every other connection to a Python peer that records what it hears, the
 `-addnode` peer included (BIP324 or v1, as the node opens). The transaction stays out of the
