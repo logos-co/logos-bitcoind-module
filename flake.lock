@@ -86,11 +86,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1791677303,
-        "narHash": "sha256-moGVmk/p2lrl5/vqh0YpSdw/jZzyWDQ+G/eEKgKuAHQ=",
+        "lastModified": 1793225498,
+        "narHash": "sha256-JPnY7Y4ZcWTDvi91sxsO4vMPv0BVuuMl+p3zpwXrzWM=",
         "owner": "logos-co",
         "repo": "logos-bitcoin-core-nix",
-        "rev": "eb0846bd8458d42b3e11098e906e338f3c48a0e4",
+        "rev": "eae192675e51e337f611073432af7f8766ca0a23",
         "type": "github"
       },
       "original": {
