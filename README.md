@@ -31,11 +31,16 @@ Event: `bitcoindStateChanged(payloadJson)` on every lifecycle transition (`stopp
 
 Networks are `mainnet`, `testnet4`, `signet` and `regtest`.
 
+`tor_module` is an optional dependency: a start asks it for its SOCKS port when the node is to send
+its transactions over Tor ([Private sends](#private-sends-through-logos-tor)).
+
 `status()` carries `state`, `network`, `version`, `uptimeSecs`, `lastError`, and from Core's
 RPC `blocks`, `headers`, `verificationProgress`, `initialSync`, `peersOut`, `pruneHeight`
 (0 on an unpruned node), `filterIndexHeight`, `tipAgeSecs` (the tip block's timestamp against
 the clock) and `sizeOnDisk`, and `dbcacheMiB`, the cache the node was started with (0 for
 Core's default). Numbers are -1 until known and while the node is not running.
+`privateSends` says what the node does with its own transactions now, and `privateSendsReason`
+why when that is `unavailable` or `restart` ([below](#private-sends-through-logos-tor)).
 A thread samples the node every second, so `status()` never waits on Core's locks; `state`
 itself is read live.
 
@@ -57,8 +62,9 @@ authorized, otherwise), and only for these methods (`-32601` otherwise; `src/rpc
 `getblockfilter`, `getblockfrompeer`, `getrawmempool`, `getmempoolentry`, `getrawtransaction`,
 `sendrawtransaction`, `estimatesmartfee`, `getnetworkinfo`, `getpeerinfo`. The wallet core's
 filter restore reads `getblockfilter` and fetches a pruned block it needs with
-`getblockfrompeer`, which asks one of the node's own peers: those connections follow the node's
-proxy setting (`-proxy`, `-onlynet=onion`), so nothing leaves outside it. `getrawtransaction`
+`getblockfrompeer`, which asks one of the node's own peers: with a proxy every peer is an onion
+service behind it (`-proxy`, `-onlynet=onion`), so nothing leaves outside it; without one the
+peer may be a clearnet one, as for the node's sync. `getrawtransaction`
 serves the mempool's transactions, and a block's with its hash.
 On regtest, for the wallet's end-to-end tests, the same callers may also mine with
 `generatetoaddress` and `generateblock`; they are refused on every other network, judged by the
@@ -80,7 +86,8 @@ Per network, persisted in the instance directory (`bitcoind.json`).
 | `pruneMiB` | `2048` mainnet, `550` elsewhere | MiB of recent blocks kept; `0` keeps every block. Core's minimum is 550 |
 | `dbcacheMiB` | `0` | UTXO cache during initial sync; `0` leaves Core's default for the machine's memory. See below |
 | `maxMempoolMiB` | `300` | |
-| `proxy` | `""` | Tor's SOCKS address. Set, it adds `-proxy`, `-onlynet=onion` and `-privatebroadcast` |
+| `proxy` | `""` | Tor's SOCKS address. Set, it adds `-proxy`, `-onlynet=onion` and `-privatebroadcast`, whatever `privateSends` says |
+| `privateSends` | `true`, `false` on regtest | With no `proxy`: the node's own transactions over Logos' Tor, `-onion=<its SOCKS port>` and `-privatebroadcast`; the node still syncs directly. See below |
 | `logCategories` | `[]` | Core `-debug` categories, such as `["net","mempool"]` |
 | `addNodes` | `[]` | Up to 8 peers to keep a connection to, `host:port` (Core's `-addnode`), such as one's own node |
 | `exposeRpc` | `false` | Opens Core's RPC server on 127.0.0.1 for other programs; see below |
@@ -93,12 +100,21 @@ again, and gets the sync-time cache.
 
 Every start also passes `-blockfilterindex=1`, `-disablewallet`, `-persistmempool=0`,
 `-listen=0` and `-noconf`. Core refuses `-privatebroadcast` when neither Tor nor I2P is
-reachable, so without a proxy (clearnet, or regtest) the node broadcasts the ordinary way.
+reachable, so with neither a proxy nor Logos' Tor (`privateSends` off, as on regtest by default,
+or Tor unavailable) the node broadcasts the ordinary way.
 
 ## Private broadcast
 
-With a proxy, the node runs with `-privatebroadcast` (and `-proxy`, `-onlynet=onion`). What Bitcoin
-Core 31.2 does with it, from its source at the v31.2 tag (241537a):
+The node runs with `-privatebroadcast` in two cases:
+
+- **Through Logos' Tor**, `privateSends` with no `proxy`, the default on mainnet, testnet4 and
+  signet: `-onion=<tor_module's SOCKS port>`, without `-proxy` or `-onlynet`. Tor carries the
+  private broadcast connections and any connection to an onion service; the node syncs over
+  clearnet as before. [Below](#private-sends-through-logos-tor).
+- **Through the user's proxy**, `proxy` set: `-proxy` and `-onlynet=onion`, so every connection
+  goes through the proxy to onion services.
+
+What Bitcoin Core 31.2 does with it, from its source at the v31.2 tag (241537a):
 
 - `sendrawtransaction` leaves the transaction out of the node's mempool and hands it to private
   broadcast (`rpc/mempool.cpp:130`, `node/transaction.cpp:105`). Core's own wallet is not
@@ -137,7 +153,65 @@ mempool and reaches the second node; the other two private connections each get 
 `inv` and the transaction, then close; none of the 11 to 13 existing connections (manual,
 outbound full relay, block relay only, feeler) hears of it. A control run without
 `-privatebroadcast` tells the existing peer. `nix build .#checks.<system>.private-broadcast` runs
-it (about a minute).
+it (about a minute); `private-broadcast-tor` runs the same with Logos' Tor's flags (below).
+
+### Private sends through Logos' Tor
+
+With `privateSends` and no `proxy`, a start asks `tor_module` for its SOCKS port and passes
+`-onion=IP:PORT -privatebroadcast`. What Core 31.2 does with that, from the same source:
+
+- `-onion` alone gives onion services a proxy and keeps them reachable (`init.cpp:1768`, `:1792`).
+  IPv4 and IPv6 stay reachable with no proxy: only `-proxy` sets theirs (`init.cpp:1707`). So the
+  check that Tor or I2P is reachable passes (`init.cpp:2259`), and the node's connections to
+  clearnet peers, for blocks, headers and relay, are made directly, as without Tor.
+- Private broadcast picks onion services, and IPv4 or IPv6 peers through the same Tor proxy once
+  one outbound connection over Tor has completed its handshake (`net.cpp:3102`, `:3161`,
+  `:4116`). It never picks a direct connection.
+- `-proxyrandomize` (on by default, `init.cpp:152`) gives each connection through the onion proxy
+  its own SOCKS credentials (`init.cpp:1786`), and `tor_module` never lets streams with different
+  credentials share a circuit (its README, "The SOCKS port"): each private broadcast connection
+  rides its own circuit.
+- Onion services being reachable, addrman can also pick some for the node's ordinary outbound
+  connections: those go through Tor, the rest over clearnet. The node's clearnet peers still see
+  this computer's IP address running a Bitcoin node; what private broadcast hides is which node a
+  transaction came from, as above.
+
+`tests/private_broadcast_test.py --mode tor` checks it with these flags and an `-addnode` the
+node reaches directly, as a clearnet peer: Core starts with them; `getnetworkinfo` shows onion
+services through the proxy and IPv4 and IPv6 direct; the transaction stays out of the mempool and
+reaches the second node through the proxy; the other two private connections get the bare
+version, `inv` and the transaction; neither the direct peer nor the automatic connections to
+onion services through the proxy (10 and 11 in two runs on 2026-11-06) hear of it; and every private
+broadcast connection in the node's log went through the proxy. The control run without
+`-privatebroadcast` tells the direct peer. No test reaches an IPv4 peer through Tor: a routable
+IPv4 address in addrman would also be dialled directly, by the node's sync.
+
+**Logos' Tor and its SOCKS port.**
+
+- A start asks `tor_module.status()` only when it would use the answer, since asking starts an
+  idle Tor. Its `socks`, `socks5h://IP:PORT`, becomes `-onion=IP:PORT`. The module waits up to
+  2 s for it.
+- When `tor_module` is not loaded, does not answer, answers an error, or has no SOCKS port (the
+  user turned it off in the Tor app), the node starts without private sends and broadcasts the
+  ordinary way: `status()` says `privateSends: "unavailable"` and why. A later start asks again.
+- Core reads `-onion` once, at start. While the node runs with private sends the module asks
+  `tor_module` again every 30 s; when the port has moved (another chosen in the Tor app, or a
+  restarted Tor that found 9250 taken) or closed, `status()` says `privateSends: "restart"` and
+  why. Until the node restarts, its private broadcast connections fail at the old port and Core
+  keeps trying others there; none goes out directly.
+- Transactions waiting for private broadcast are kept in memory only, outside the mempool
+  (`private_broadcast.h:216`), so a stop or restart forgets those not yet sent.
+
+`status().privateSends`, for the node that runs now:
+
+| Value | |
+|---|---|
+| `on` | Private broadcast through Logos' Tor |
+| `proxy` | Private broadcast through the user's proxy |
+| `off` | `privateSends` off and no proxy: the ordinary way |
+| `unavailable` | `privateSends` on, but Logos' Tor had no SOCKS port to give at start: the ordinary way. `privateSendsReason` says why |
+| `restart` | Started `on`, but Tor's SOCKS port has since moved or closed. `privateSendsReason` says what changed |
+| `""` | No node running (`stopped` or `failed`) |
 
 ## Exposing the node to other programs
 
@@ -211,4 +285,6 @@ of LevelDB, secp256k1, crc32c, minisketch and libevent as `NOTICES.bitcoind_c`.
 nix build .#install    # result/modules/bitcoind_module: the plugin and libbitcoind_c
 nix build .#checks.aarch64-darwin.rpc-allowlist   # rpc()'s allowlist, on its own
 nix build .#checks.aarch64-darwin.private-broadcast   # private broadcast with the module's flags
+nix build .#checks.aarch64-darwin.private-broadcast-tor   # the same through Logos' Tor (privateSends)
+nix build .#checks.aarch64-darwin.private-sends   # tor_module's reply, the modes and their flags
 ```

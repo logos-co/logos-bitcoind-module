@@ -7,6 +7,8 @@
 
 #include <logos_caller.h>
 
+#include "logos_sdk.h"
+
 #include "bitcoind_c.h"
 #include "bitcoind_argv.h"
 #include "rpc_allowlist.h"
@@ -25,6 +27,16 @@ constexpr auto kSyncFlushInterval = std::chrono::minutes(3);
 constexpr int64_t kAfterSyncCacheMiB = 300;
 // A tip older than this means the node is catching up again, so it gets the sync-time cache.
 constexpr int64_t kStaleTipSecs = 7 * 24 * 3600;
+
+// tor_module answers status() at once; this bounds a start when it is not loaded.
+constexpr int kTorBudgetMs = 1500;
+// While the node sends through Logos' Tor, its SOCKS port is checked this often.
+constexpr int64_t kTorRecheckMs = 30000;
+
+int64_t steadyMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 std::string takeString(const char* s) {
     std::string out = s ? s : "";
@@ -148,6 +160,8 @@ json BitcoindModuleImpl::defaultsFor(const std::string& network) const {
         {"dbcacheMiB", 0},  // 0: Core's default for this machine's memory
         {"maxMempoolMiB", 300},
         {"proxy", ""},
+        // The node's own transactions over Logos' Tor when there is no proxy; regtest has no onion peers.
+        {"privateSends", network != "regtest"},
         {"logCategories", json::array()},
         {"exposeRpc", false},
         // Peers to keep a connection to, host:port (Core's -addnode), such as one's own node.
@@ -257,12 +271,20 @@ void BitcoindModuleImpl::persist() {
 StdLogosResult BitcoindModuleImpl::start(const std::string& network) {
     if (m_unloading) return fail("unloading");
     std::lock_guard<std::mutex> lifecycle(m_lifecycleMutex);
-    json argv;
+    json s;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (!knownNetwork(network)) return fail("unknown network: " + network);
         if (m_persistDir.empty()) return fail("no persistence path yet");
-        const json s = settingsFor(network);
+        s = settingsFor(network);
+    }
+    // Asked only when this start would send through it, since asking starts an idle Tor. No
+    // answer, or no SOCKS port, starts the node without private sends; status() says why.
+    std::string torSocks, torWhy;
+    if (s["proxy"].get<std::string>().empty() && s["privateSends"].get<bool>()) torSocks = askTor(torWhy);
+    json argv;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
         const fs::path dataDir = s["dataDir"].get<std::string>();
         std::error_code ec;
         fs::create_directories(dataDir, ec);
@@ -270,9 +292,13 @@ StdLogosResult BitcoindModuleImpl::start(const std::string& network) {
         // The chain is nobody else's business, and debug.log can name our peers.
         fs::permissions(dataDir, fs::perms::owner_all, fs::perm_options::replace, ec);
         const int64_t cache = cacheFor(network, s["dbcacheMiB"].get<int64_t>());
-        argv = bitcoind_argv::argvFor(network, s, cache);
+        argv = bitcoind_argv::argvFor(network, s, cache, torSocks);
         m_network = network;
         m_dbcacheMiB = cache;
+        m_privateSends = private_sends::modeFor(s, torSocks);
+        m_privateSendsReason = m_privateSends == "unavailable" ? torWhy : "";
+        m_torSocksUsed = torSocks;
+        m_lastTorCheckMs = steadyMs();
         m_logFile = (dataDir / netSubdir(network) / "debug.log").string();
     }
     {
@@ -289,6 +315,65 @@ StdLogosResult BitcoindModuleImpl::start(const std::string& network) {
         std::chrono::steady_clock::now().time_since_epoch()).count();
     refresh();
     return {true, status()};
+}
+
+// Logos' Tor SOCKS port as IP:PORT, from tor_module (an optional dependency); "" and why not.
+std::string BitcoindModuleImpl::askTor(std::string& why) {
+    struct Reply {
+        std::mutex mutex;
+        std::condition_variable done;
+        bool answered = false;
+        logos::AsyncResult<std::string> r;
+    };
+    auto reply = std::make_shared<Reply>();
+    // Async, waited for here: the reply lands on the main thread, which this worker leaves free.
+    modules().tor_module.statusAsyncResult([reply](logos::AsyncResult<std::string> r) {
+        { std::lock_guard<std::mutex> l(reply->mutex); reply->r = std::move(r); reply->answered = true; }
+        reply->done.notify_all();
+    }, kTorBudgetMs);
+    logos::AsyncResult<std::string> r;
+    {
+        std::unique_lock<std::mutex> l(reply->mutex);
+        if (!reply->done.wait_for(l, std::chrono::milliseconds(kTorBudgetMs + 500), [&] { return reply->answered; })) {
+            why = "tor_module did not answer";
+            return "";
+        }
+        r = reply->r;
+    }
+    if (!r.ok()) {
+        why = r.error.code == "object_unavailable" ? "tor_module is not loaded"
+            : r.error.code == "timeout" ? "tor_module did not answer"
+            : "tor_module: " + (r.error.message.empty() ? r.error.code : r.error.message);
+        return "";
+    }
+    const private_sends::TorSocks t = private_sends::torSocksFrom(r.value);
+    m_torSeen->note(t);
+    why = t.why;
+    return t.socks;
+}
+
+// While the node sends through Logos' Tor, asks whether Tor still serves the port it started with.
+// A move is reported ("restart"), not followed: Core reads -onion once. Never waits.
+void BitcoindModuleImpl::recheckTor() {
+    if (m_unloading || BITCOIND_state() != BITCOIND_RUNNING) return;
+    { std::lock_guard<std::mutex> lock(m_mutex); if (m_privateSends != "on") return; }
+    const int64_t now = steadyMs();
+    if (now - m_lastTorCheckMs < kTorRecheckMs) return;
+    m_lastTorCheckMs = now;
+    std::shared_ptr<private_sends::TorSeen> seen = m_torSeen;
+    modules().tor_module.statusAsyncResult([seen](logos::AsyncResult<std::string> r) {
+        if (r.ok()) seen->note(private_sends::torSocksFrom(r.value));
+    }, kTorBudgetMs);
+}
+
+// What the node does with its own transactions now, and why when unavailable or stale.
+std::pair<std::string, std::string> BitcoindModuleImpl::privateSendsNow(const std::string& state) {
+    if (state == "stopped" || state == "failed") return {"", ""};
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_privateSends != "on") return {m_privateSends, m_privateSendsReason};
+    std::lock_guard<std::mutex> l(m_torSeen->mutex);
+    if (!m_torSeen->known || m_torSeen->socks == m_torSocksUsed) return {"on", ""};
+    return {"restart", m_torSeen->socks.empty() ? m_torSeen->why : "Tor's SOCKS port moved to " + m_torSeen->socks};
 }
 
 // Writes the cache while the node still runs, so the flush shows as its own state.
@@ -362,6 +447,7 @@ void BitcoindModuleImpl::pollLoop() {
             && chain["tipAgeSecs"].get<int64_t>() >= 0)
             noteTip(chain["tipAgeSecs"].get<int64_t>());
         refresh();
+        recheckTor();
         // Keep the cache small during initial sync, so a stop or unload has little to write.
         const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -421,6 +507,9 @@ void BitcoindModuleImpl::refresh(const char* forceState) {
     s["uptimeSecs"] = st.value("uptimeSecs", 0);
     s["lastError"] = st.value("lastError", "");
     { std::lock_guard<std::mutex> lock(m_mutex); s["dbcacheMiB"] = m_dbcacheMiB; }
+    const auto ps = privateSendsNow(s["state"].get<std::string>());
+    s["privateSends"] = ps.first;
+    s["privateSendsReason"] = ps.second;
     if (!forceState) {
         std::lock_guard<std::mutex> lock(m_sampleMutex);
         m_sample = s;
@@ -447,6 +536,9 @@ LogosMap BitcoindModuleImpl::status() {
     // Not a range-for over chainDefaults().items(): C++17 destroys that temporary before the
     // loop runs, and Windows' heap crashed the host on it while the node was stopped.
     if (state != BITCOIND_RUNNING) st.update(chainDefaults());
+    const auto ps = privateSendsNow(st["state"].get<std::string>());
+    st["privateSends"] = ps.first;
+    st["privateSendsReason"] = ps.second;
     return st;
 }
 

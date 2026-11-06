@@ -6,11 +6,14 @@
   "interface": "universal",
   "concurrency": "multi",
   "category": "wallet",
-  "description": "Runs a Bitcoin node (Bitcoin Core) in-process and serves the wallet Core's RPC over Logos IPC: per-network config, start, stop, flush, status, rpc and log tail.",
+  "description": "Runs a Bitcoin node (Bitcoin Core) in-process and serves the wallet Core's RPC over Logos IPC: per-network config, start, stop, flush, status, rpc and log tail. By default it sends its own transactions over the Tor that comes with Logos (private broadcast), while it syncs directly.",
   "author": "Logos Core Team",
   "main": "bitcoind_module_plugin",
   "codegen": { "impl_header": "bitcoind_module_impl.h", "impl_class": "BitcoindModuleImpl" },
   "dependencies": [],
+  "optional_dependencies": [
+    { "name": "tor_module", "version": "~0.2.0" }
+  ],
   "include": ["COPYING.bitcoin", "NOTICES.bitcoind_c"],
   "capabilities": [],
   "nix": {

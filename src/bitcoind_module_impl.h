@@ -4,14 +4,18 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <logos_json.h>
 #include <logos_module_context.h>
 #include <logos_result.h>
+
+#include "private_sends.h"
 
 /// A Bitcoin node (Bitcoin Core) running in-process through libbitcoind_c. One node at a
 /// time; its lifetime is this module's lifetime. The wallet reaches it through rpc(), not a port.
@@ -21,7 +25,8 @@ public:
     ~BitcoindModuleImpl();
 
     /// Merge `config` into the stored settings for `network` (mainnet|testnet4|signet|regtest).
-    /// Unknown keys and wrong types are refused.
+    /// Unknown keys and wrong types are refused. `privateSends` (default true but on regtest)
+    /// sends the node's own transactions over Logos' Tor when `proxy` is empty.
     StdLogosResult configure(const std::string& network, const LogosMap& config);
 
     /// Stored settings for `network`, with defaults filled in; empty for an unknown network.
@@ -44,10 +49,12 @@ public:
     ///   "version": string, "uptimeSecs": number, "lastError": string, "blocks": number,
     ///   "headers": number, "verificationProgress": number, "initialSync": bool,
     ///   "peersOut": number, "pruneHeight": number, "filterIndexHeight": number,
-    ///   "tipAgeSecs": number, "sizeOnDisk": number, "dbcacheMiB": number }
+    ///   "tipAgeSecs": number, "sizeOnDisk": number, "dbcacheMiB": number,
+    ///   "privateSends": "on|proxy|off|unavailable|restart|", "privateSendsReason": string }
     /// @endcode
     /// Never waits on the node: a thread samples it every second and this serves the last
-    /// sample. Numbers are -1 until known.
+    /// sample. Numbers are -1 until known. `privateSends` is what the running node does with its
+    /// own transactions ("" while none runs); the reason says why for unavailable and restart.
     LogosMap status();
 
     /// One call into Core's RPC table, in-process. `paramsJson` is a JSON array or object
@@ -81,6 +88,9 @@ private:
     void refresh(const char* forceState = nullptr);
     nlohmann::json sampleChain();
     void unloadLog(const std::string& line);
+    std::string askTor(std::string& why);
+    void recheckTor();
+    std::pair<std::string, std::string> privateSendsNow(const std::string& state);
 
     std::mutex m_mutex;
     std::string m_persistDir;                            // guarded by m_mutex
@@ -91,6 +101,12 @@ private:
     std::string m_logFile;                               // guarded by m_mutex; the last start's
     int64_t m_dbcacheMiB = 0;                            // guarded by m_mutex; the last start's, 0 = Core's
     nlohmann::json m_state = nlohmann::json::object();   // guarded by m_mutex; bitcoind-state.json
+    std::string m_privateSends;                          // guarded by m_mutex; the last start's mode
+    std::string m_privateSendsReason;                    // guarded by m_mutex; why unavailable
+    std::string m_torSocksUsed;                          // guarded by m_mutex; the last start's -onion
+    // Shared with tor_module's replies, which can land after the module is gone.
+    std::shared_ptr<private_sends::TorSeen> m_torSeen = std::make_shared<private_sends::TorSeen>();
+    std::atomic<int64_t> m_lastTorCheckMs{0};            // steady clock; the last ask of tor_module
     std::atomic<bool> m_flushing{false};                 // stop() is writing the cache
 
     std::mutex m_lifecycleMutex;  // one start or stop at a time
