@@ -241,6 +241,21 @@ connection threads: a `connect()` in flight waited out `-timeout` (5 s) before `
 join them. logos-bitcoin-core-nix's patch 0005 makes that wait interruptible, so a stop cuts it
 short; over Tor the wait is the SOCKS5 handshake, which Core already interrupts.
 
+## Verified, 2026-11-06
+
+Private sends in a real `logos_host` under logosctl (portable bundle, pre-release 66d098d), macOS
+aarch64, HOME isolated, regtest with `privateSends` configured on:
+
+- Without `tor_module`: `unavailable`, `tor_module is not loaded`, running 2.0 s after `start`
+  (the ask's timeout); Core's log shows no `-onion` and no `-privatebroadcast`.
+- With `tor_module` loaded (9250 was taken, so it listened on another loopback port): `on`,
+  running 0.25 s after `start`, Core's log shows `-onion=127.0.0.1:<that port>` and
+  `-privatebroadcast`.
+- `set_socks` to another port while running: `restart`, `Tor's SOCKS port moved to
+  127.0.0.1:<new port>`, within the 30 s check; set back to the first port: `on` again.
+- SOCKS port turned off, then a new start: `unavailable`, `Tor's SOCKS port is off`, no Tor
+  flags. After `stop`: `""`.
+
 ## Verified, 2026-10-10
 
 In a real `logos_host` under logosctl, with HOME isolated:
