@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 
@@ -30,8 +31,11 @@ constexpr int64_t kStaleTipSecs = 7 * 24 * 3600;
 
 // tor_module answers status() at once; this bounds a start when it is not loaded.
 constexpr int kTorBudgetMs = 1500;
-// While the node sends through Logos' Tor, its SOCKS port is checked this often.
+// While the node sends through Logos' Tor, tor_module is also asked this often: the fallback for
+// a missed status_changed.
 constexpr int64_t kTorRecheckMs = 30000;
+// The automatic restart's log in the instance directory: counts and reasons, never a transaction.
+constexpr std::uintmax_t kFollowLogMax = 256 * 1024;
 
 int64_t steadyMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -53,6 +57,29 @@ std::string rpcRefusal(int code, const std::string& why) {
 void appendLine(const std::string& path, const std::string& line) {
     std::ofstream f(path, std::ios::app);
     if (f) f << line << '\n';
+}
+
+std::string utcNow() {
+    const std::time_t t = std::time(nullptr);
+    char buf[32];
+    std::strftime(buf, sizeof buf, "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
+    return buf;
+}
+
+// One tor_module reply as a sighting of its port: false when it says nothing (a timeout, Tor
+// still opening), so the last sighting stands.
+bool torSighting(const logos::AsyncResult<std::string>& r, std::string& socks, std::string& why) {
+    if (!r.ok()) {
+        if (r.error.code != "object_unavailable") return false;
+        socks.clear();
+        why = "tor_module is not loaded";
+        return true;
+    }
+    const private_sends::TorSocks t = private_sends::torSocksFrom(r.value);
+    if (!t.answered) return false;
+    socks = t.socks;
+    why = t.why;
+    return true;
 }
 
 const char* stateName(int state) {
@@ -97,22 +124,43 @@ BitcoindModuleImpl::~BitcoindModuleImpl() {
 }
 
 void BitcoindModuleImpl::onContextReady() {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    m_persistDir = instancePersistencePath();
-    if (m_persistDir.empty()) return;
-    std::error_code ec;
-    fs::create_directories(m_persistDir, ec);
-    std::ifstream f(fs::path(m_persistDir) / "bitcoind.json");
-    if (f) {
-        m_config = json::parse(f, nullptr, false);
-        if (!m_config.is_object()) m_config = json::object();
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_persistDir = instancePersistencePath();
+        if (m_persistDir.empty()) return;
+        std::error_code ec;
+        fs::create_directories(m_persistDir, ec);
+        std::ifstream f(fs::path(m_persistDir) / "bitcoind.json");
+        if (f) {
+            m_config = json::parse(f, nullptr, false);
+            if (!m_config.is_object()) m_config = json::object();
+        }
+        std::ifstream sf(fs::path(m_persistDir) / "bitcoind-state.json");
+        if (sf) {
+            m_state = json::parse(sf, nullptr, false);
+            if (!m_state.is_object()) m_state = json::object();
+        }
+        loadCallers();
     }
-    std::ifstream sf(fs::path(m_persistDir) / "bitcoind-state.json");
-    if (sf) {
-        m_state = json::parse(sf, nullptr, false);
-        if (!m_state.is_object()) m_state = json::object();
-    }
-    loadCallers();
+    watchTor();
+}
+
+// Subscribes once, outside m_mutex. It arms when tor_module loads, now or later, and again after
+// it reloads. The callbacks run on the IPC thread: they only record what they saw.
+void BitcoindModuleImpl::watchTor() {
+    std::shared_ptr<TorWatch> tor = m_tor;
+    modules().tor_module.onStatus_changed([tor](const std::string& payload) {
+        const private_sends::TorSocks t = private_sends::torSocksFrom(payload);
+        if (!t.answered) return;
+        std::lock_guard<std::mutex> l(tor->mutex);
+        tor_follow::observe(tor->seen, t.socks, t.why, steadyMs());
+    });
+    modules().tor_module.onSubscriptionStatus([tor](logos::SubStatus st, std::uint64_t) {
+        std::lock_guard<std::mutex> l(tor->mutex);
+        // Unloading closes the port without an event, so losing tor_module means a closed port.
+        if (st == logos::SubStatus::Armed) tor->armed = true;
+        else tor_follow::observe(tor->seen, "", "tor_module stopped", steadyMs());
+    });
 }
 
 // Absent file: the defaults. Unreadable file: nobody, so a typo never opens the door.
@@ -271,6 +319,24 @@ void BitcoindModuleImpl::persist() {
 StdLogosResult BitcoindModuleImpl::start(const std::string& network) {
     if (m_unloading) return fail("unloading");
     std::lock_guard<std::mutex> lifecycle(m_lifecycleMutex);
+    // Before anything changes: the running node keeps its mode and its Tor port.
+    const int st = BITCOIND_state();
+    if (st == BITCOIND_STARTING || st == BITCOIND_RUNNING || st == BITCOIND_STOPPING)
+        return fail("a node is already running in this process");
+    {
+        // A user's start begins a run of its own: nothing carried, and a fresh restart window.
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_carryHex.clear();
+        m_carried = m_carryIgnored = 0;
+        m_carryError.clear();
+        m_hadAuto = false;
+    }
+    return startLocked(network);
+}
+
+// Under m_lifecycleMutex: a user's start, or the start half of an automatic restart.
+StdLogosResult BitcoindModuleImpl::startLocked(const std::string& network) {
+    if (m_unloading) return fail("unloading");
     json s;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -298,7 +364,7 @@ StdLogosResult BitcoindModuleImpl::start(const std::string& network) {
         m_privateSends = private_sends::modeFor(s, torSocks);
         m_privateSendsReason = m_privateSends == "unavailable" ? torWhy : "";
         m_torSocksUsed = torSocks;
-        m_lastTorCheckMs = steadyMs();
+        m_lastTorAskMs = steadyMs();
         m_logFile = (dataDir / netSubdir(network) / "debug.log").string();
     }
     {
@@ -306,7 +372,9 @@ StdLogosResult BitcoindModuleImpl::start(const std::string& network) {
         ++m_runGen;
         m_chain = chainDefaults();
     }
-    if (BITCOIND_start(argv.dump().c_str()) != 0) {
+    const bool started = BITCOIND_start(argv.dump().c_str()) == 0;
+    { std::lock_guard<std::mutex> lock(m_mutex); m_userStarted = started; }
+    if (!started) {
         const std::string why = takeString(BITCOIND_last_error());
         refresh();
         return fail(why);
@@ -326,6 +394,9 @@ std::string BitcoindModuleImpl::askTor(std::string& why) {
         logos::AsyncResult<std::string> r;
     };
     auto reply = std::make_shared<Reply>();
+    std::shared_ptr<TorWatch> tor = m_tor;
+    uint64_t at = 0;
+    { std::lock_guard<std::mutex> l(tor->mutex); at = tor->seen.sightings; }
     // Async, waited for here: the reply lands on the main thread, which this worker leaves free.
     modules().tor_module.statusAsyncResult([reply](logos::AsyncResult<std::string> r) {
         { std::lock_guard<std::mutex> l(reply->mutex); reply->r = std::move(r); reply->answered = true; }
@@ -334,11 +405,16 @@ std::string BitcoindModuleImpl::askTor(std::string& why) {
     logos::AsyncResult<std::string> r;
     {
         std::unique_lock<std::mutex> l(reply->mutex);
-        if (!reply->done.wait_for(l, std::chrono::milliseconds(kTorBudgetMs + 500), [&] { return reply->answered; })) {
-            why = "tor_module did not answer";
-            return "";
-        }
-        r = reply->r;
+        const bool done = reply->done.wait_for(l, std::chrono::milliseconds(kTorBudgetMs + 500), [&] { return reply->answered; });
+        if (done) r = reply->r;
+        else r.error.code = "timeout";
+    }
+    std::string socks;
+    {
+        // This start's answer is what the node runs with; a sighting since is newer and stands.
+        std::lock_guard<std::mutex> l(tor->mutex);
+        if (torSighting(r, socks, why)) tor_follow::answer(tor->seen, at, socks, why, steadyMs());
+        else if (tor->seen.sightings == at) tor->seen.known = false;
     }
     if (!r.ok()) {
         why = r.error.code == "object_unavailable" ? "tor_module is not loaded"
@@ -347,38 +423,185 @@ std::string BitcoindModuleImpl::askTor(std::string& why) {
         return "";
     }
     const private_sends::TorSocks t = private_sends::torSocksFrom(r.value);
-    m_torSeen->note(t);
     why = t.why;
     return t.socks;
 }
 
-// While the node sends through Logos' Tor, asks whether Tor still serves the port it started with.
-// A move is reported ("restart"), not followed: Core reads -onion once. Never waits.
-void BitcoindModuleImpl::recheckTor() {
-    if (m_unloading || BITCOIND_state() != BITCOIND_RUNNING) return;
-    { std::lock_guard<std::mutex> lock(m_mutex); if (m_privateSends != "on") return; }
-    const int64_t now = steadyMs();
-    if (now - m_lastTorCheckMs < kTorRecheckMs) return;
-    m_lastTorCheckMs = now;
-    std::shared_ptr<private_sends::TorSeen> seen = m_torSeen;
-    modules().tor_module.statusAsyncResult([seen](logos::AsyncResult<std::string> r) {
-        if (r.ok()) seen->note(private_sends::torSocksFrom(r.value));
+// Never waits: the answer lands in m_tor, unless something was seen since it was asked.
+void BitcoindModuleImpl::askTorAsync() {
+    std::shared_ptr<TorWatch> tor = m_tor;
+    uint64_t at = 0;
+    { std::lock_guard<std::mutex> l(tor->mutex); at = tor->seen.sightings; }
+    modules().tor_module.statusAsyncResult([tor, at](logos::AsyncResult<std::string> r) {
+        std::string socks, why;
+        if (!torSighting(r, socks, why)) return;
+        std::lock_guard<std::mutex> l(tor->mutex);
+        tor_follow::answer(tor->seen, at, socks, why, steadyMs());
     }, kTorBudgetMs);
 }
 
-// What the node does with its own transactions now, and why when unavailable or stale.
-std::pair<std::string, std::string> BitcoindModuleImpl::privateSendsNow(const std::string& state) {
-    if (state == "stopped" || state == "failed") return {"", ""};
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (m_privateSends != "on") return {m_privateSends, m_privateSendsReason};
-    std::lock_guard<std::mutex> l(m_torSeen->mutex);
-    if (!m_torSeen->known || m_torSeen->socks == m_torSocksUsed) return {"on", ""};
-    return {"restart", m_torSeen->socks.empty() ? m_torSeen->why : "Tor's SOCKS port moved to " + m_torSeen->socks};
+tor_follow::Decision BitcoindModuleImpl::decideNow() {
+    tor_follow::Run run;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const json s = settingsFor(m_network);
+        run.userStarted = m_userStarted;
+        run.canRestart = m_network != "regtest" && s.value("proxy", "").empty() && s.value("privateSends", false);
+        run.mode = m_privateSends;
+        run.socksUsed = m_torSocksUsed;
+        run.startWhy = m_privateSendsReason;
+        run.hadAuto = m_hadAuto;
+        run.lastAutoAt = m_lastAutoMs;
+    }
+    tor_follow::Seen seen;
+    { std::lock_guard<std::mutex> l(m_tor->mutex); seen = m_tor->seen; }
+    return tor_follow::decide(run, seen, steadyMs());
 }
 
-// Writes the cache while the node still runs, so the flush shows as its own state.
+// On the poll thread, never on tor_module's callback thread: asks Tor after an arm and every
+// kTorRecheckMs, and runs the restart tor_follow::decide() calls for once it is due.
+void BitcoindModuleImpl::followTor() {
+    if (m_unloading) return;
+    bool following = false;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        following = m_userStarted && (m_privateSends == "on" || m_privateSends == "unavailable");
+    }
+    bool armed = false;
+    { std::lock_guard<std::mutex> l(m_tor->mutex); armed = m_tor->armed; m_tor->armed = false; }
+    const int st = BITCOIND_state();
+    if (!following || (st != BITCOIND_RUNNING && st != BITCOIND_STARTING)) return;
+    const int64_t now = steadyMs();
+    if (armed || now - m_lastTorAskMs >= kTorRecheckMs) {
+        m_lastTorAskMs = now;
+        askTorAsync();
+    }
+    const tor_follow::Decision d = decideNow();
+    if (!d.restartTo.empty() && now >= d.dueAt && BITCOIND_state() == BITCOIND_RUNNING) autoRestart();
+}
+
+// The same network and settings, at Tor's port as it is now. Pending private broadcasts are read
+// first and sent again once the new node answers (carryOver).
+void BitcoindModuleImpl::autoRestart() {
+    std::unique_lock<std::mutex> lifecycle(m_lifecycleMutex, std::try_to_lock);
+    if (!lifecycle.owns_lock()) return;  // a user's start or stop is under way; look again later
+    // Again under the lock: a stop() or start() may have run since the poll looked.
+    const tor_follow::Decision d = decideNow();
+    if (d.restartTo.empty() || steadyMs() < d.dueAt || m_unloading || BITCOIND_state() != BITCOIND_RUNNING) return;
+    std::string network, reason;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        network = m_network;
+        reason = m_autoReason = tor_follow::restartingReason(m_privateSends, d.restartTo);
+    }
+    m_autoRestarting = true;
+    // A send under way lands before the read, and rpc() refuses new ones until the start.
+    for (int i = 0; i < 500 && m_sendsInFlight > 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    std::string readWhy;
+    const std::vector<std::string> pending =
+        carry_over::pendingFrom(takeString(BITCOIND_rpc("getprivatebroadcastinfo", nullptr)), readWhy);
+    const int64_t at = steadyMs();
+    stopLocked();
+    const StdLogosResult started = startLocked(network);
+    std::string newMode;
+    size_t carrying = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_hadAuto = true;
+        m_lastAutoMs = at;
+        newMode = m_privateSends;
+        carry_over::merge(m_carryHex, pending);
+        if (!started.success) m_carryHex.clear();
+        carrying = m_carryHex.size();
+        m_carried = m_carryIgnored = 0;
+        m_carryError = readWhy.empty() ? "" : "could not read the pending private broadcasts: " + readWhy;
+        if (!started.success) m_carryError = "the node did not start again: " + started.error;
+        else if (carrying > 0 && newMode != "on" && newMode != "proxy")
+            m_carryError = std::to_string(carrying) + " held until the node can send over Tor again";
+    }
+    m_autoRestarting = false;
+    followLog("automatic restart (" + reason + "): " + (started.success ? "privateSends " + newMode : "failed, " + started.error)
+              + "; " + std::to_string(pending.size()) + " pending private broadcast(s) read"
+              + (readWhy.empty() ? "" : ", read failed: " + readWhy) + "; " + std::to_string(carrying) + " to send again");
+    refresh();
+}
+
+// Sends the carried transactions again once the restarted node answers RPC, and only over Tor:
+// to a node that came back without it they wait for the next automatic restart.
+void BitcoindModuleImpl::carryOver() {
+    std::unique_lock<std::mutex> lifecycle(m_lifecycleMutex, std::try_to_lock);
+    if (!lifecycle.owns_lock() || m_unloading || BITCOIND_state() != BITCOIND_RUNNING) return;
+    std::vector<std::string> todo;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_carryHex.empty() || (m_privateSends != "on" && m_privateSends != "proxy")) return;
+        todo = m_carryHex;
+    }
+    size_t done = 0;
+    int64_t resent = 0, ignored = 0, failed = 0;
+    std::string ignoredWhy, failedWhy;
+    for (const std::string& hex : todo) {
+        std::string why;
+        const std::string params = carry_over::resendParams(hex);
+        const carry_over::Outcome o = carry_over::outcomeOf(takeString(BITCOIND_rpc("sendrawtransaction", params.c_str())), why);
+        if (o == carry_over::Outcome::Retry) break;
+        ++done;
+        if (o == carry_over::Outcome::Resent) ++resent;
+        else if (o == carry_over::Outcome::Ignored) { ++ignored; ignoredWhy = why; }
+        else { ++failed; failedWhy = why; }
+    }
+    if (done == 0) return;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_carryHex.erase(m_carryHex.begin(), m_carryHex.begin() + static_cast<std::ptrdiff_t>(done));
+        m_carried += resent;
+        m_carryIgnored += ignored;
+        if (failed > 0) m_carryError = std::to_string(failed) + " could not be sent again: " + failedWhy;
+        else if (m_carryHex.empty() && m_carryError.find(" held until ") != std::string::npos) m_carryError.clear();
+    }
+    followLog("carried over: " + std::to_string(resent) + " sent again privately, " + std::to_string(ignored) + " ignored"
+              + (ignored ? " (" + ignoredWhy + ")" : "") + ", " + std::to_string(failed) + " failed"
+              + (failed ? " (" + failedWhy + ")" : ""));
+}
+
+// Kept small and in the instance directory; no transaction or address goes in.
+void BitcoindModuleImpl::followLog(const std::string& line) {
+    std::string dir;
+    { std::lock_guard<std::mutex> lock(m_mutex); dir = m_persistDir; }
+    if (dir.empty()) return;
+    const fs::path path = fs::path(dir) / "tor-follow.log";
+    std::error_code ec;
+    if (fs::file_size(path, ec) > kFollowLogMax && !ec) fs::rename(path, path.string() + ".1", ec);
+    appendLine(path.string(), utcNow() + " " + line);
+}
+
+// What the node does with its own transactions now, and why when it is not plainly on, off or proxy.
+std::pair<std::string, std::string> BitcoindModuleImpl::privateSendsNow(const std::string& state) {
+    if (m_autoRestarting) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return {"restart", m_autoReason};
+    }
+    if (state == "stopped" || state == "failed") return {"", ""};
+    const tor_follow::Decision d = decideNow();
+    return {d.privateSends, d.reason};
+}
+
 StdLogosResult BitcoindModuleImpl::stop() {
     std::lock_guard<std::mutex> lifecycle(m_lifecycleMutex);
+    {
+        // A user's stop ends the following, and what an automatic restart was carrying.
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_userStarted = false;
+        if (!m_carryHex.empty()) m_carryError = std::to_string(m_carryHex.size()) + " not sent again: the node was stopped";
+        m_carryHex.clear();
+    }
+    stopLocked();
+    return {true, status()};
+}
+
+// Under m_lifecycleMutex. Writes the cache while the node still runs, so the flush shows as its
+// own state.
+void BitcoindModuleImpl::stopLocked() {
     if (BITCOIND_state() == BITCOIND_RUNNING) {
         m_flushing = true;
         refresh("flushing");
@@ -389,7 +612,6 @@ StdLogosResult BitcoindModuleImpl::stop() {
     if (st == BITCOIND_RUNNING || st == BITCOIND_STARTING) refresh("stopping");
     BITCOIND_stop();
     refresh();
-    return {true, status()};
 }
 
 StdLogosResult BitcoindModuleImpl::flush() {
@@ -402,14 +624,22 @@ StdLogosResult BitcoindModuleImpl::flush() {
 // it can take longer than the host's 3 s grace. The thread is joined in the destructor.
 LogosShutdown BitcoindModuleImpl::aboutToUnload() {
     m_unloading = true;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_userStarted = false;
+        m_carryHex.clear();
+    }
     if (m_stopThread.joinable()) return LogosShutdown::Asynchronous;
     const int st = BITCOIND_state();
-    if (st == BITCOIND_STOPPED || st == BITCOIND_FAILED) {
+    if ((st == BITCOIND_STOPPED || st == BITCOIND_FAILED) && !m_autoRestarting) {
         unloadLog("aboutToUnload: node not running");
         return LogosShutdown::Synchronous;
     }
     unloadLog("aboutToUnload: stopping node");
     m_stopThread = std::thread([this] {
+        // A start, stop or automatic restart under way finishes first; with m_unloading set, none
+        // starts a node again.
+        std::lock_guard<std::mutex> lifecycle(m_lifecycleMutex);
         const auto t0 = std::chrono::steady_clock::now();
         BITCOIND_stop();
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -447,7 +677,8 @@ void BitcoindModuleImpl::pollLoop() {
             && chain["tipAgeSecs"].get<int64_t>() >= 0)
             noteTip(chain["tipAgeSecs"].get<int64_t>());
         refresh();
-        recheckTor();
+        followTor();
+        carryOver();
         // Keep the cache small during initial sync, so a stop or unload has little to write.
         const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -510,14 +741,23 @@ void BitcoindModuleImpl::refresh(const char* forceState) {
     const auto ps = privateSendsNow(s["state"].get<std::string>());
     s["privateSends"] = ps.first;
     s["privateSendsReason"] = ps.second;
+    addCarry(s);
     if (!forceState) {
         std::lock_guard<std::mutex> lock(m_sampleMutex);
         m_sample = s;
     }
     const std::string state = s["state"].get<std::string>();
-    if (state == m_emittedState || m_unloading) return;
+    if ((state == m_emittedState && ps.first == m_emittedSends) || m_unloading) return;
     m_emittedState = state;
+    m_emittedSends = ps.first;
     bitcoindStateChanged(s.dump());
+}
+
+void BitcoindModuleImpl::addCarry(json& st) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    st["privateSendsCarried"] = m_carried;
+    st["privateSendsCarryIgnored"] = m_carryIgnored;
+    st["privateSendsCarryError"] = m_carryError;
 }
 
 LogosMap BitcoindModuleImpl::status() {
@@ -539,6 +779,7 @@ LogosMap BitcoindModuleImpl::status() {
     const auto ps = privateSendsNow(st["state"].get<std::string>());
     st["privateSends"] = ps.first;
     st["privateSendsReason"] = ps.second;
+    addCarry(st);
     return st;
 }
 
@@ -563,7 +804,17 @@ std::string BitcoindModuleImpl::rpc(const std::string& method, const std::string
         if (!st.is_object() || st.value("network", "") != "regtest")
             return rpcRefusal(-32601, method + " is allowed on regtest only");
     }
-    return takeString(BITCOIND_rpc(method.c_str(), paramsJson.empty() ? nullptr : paramsJson.c_str()));
+    const char* params = paramsJson.empty() ? nullptr : paramsJson.c_str();
+    if (method != "sendrawtransaction") return takeString(BITCOIND_rpc(method.c_str(), params));
+    // Counted, so an automatic restart reads Core's pending private broadcasts after this one.
+    ++m_sendsInFlight;
+    if (m_autoRestarting) {
+        --m_sendsInFlight;
+        return rpcRefusal(-28, "the node is restarting to follow Tor's SOCKS port; send again in a few seconds");
+    }
+    std::string reply = takeString(BITCOIND_rpc(method.c_str(), params));
+    --m_sendsInFlight;
+    return reply;
 }
 
 // Reads backwards from the end, so a long-running node's log costs only the tail.

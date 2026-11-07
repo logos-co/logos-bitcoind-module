@@ -32,9 +32,9 @@
     in
     {
       packages = lib.genAttrs systems (system: module.packages.${system});
-      # rpc()'s allowlist and private sends' pure half, compiled and run on their own; and private
-      # broadcast with the module's flags, Core 31.2 in-process through libbitcoind_c, under
-      # Core's own test framework: through a proxy, and through Logos' Tor (privateSends).
+      # rpc()'s allowlist and the pure halves of private sends and Tor following, compiled and run
+      # on their own; and private broadcast with the module's flags, Core 31.2 in-process through
+      # libbitcoind_c, under Core's own test framework: through a proxy, and through Logos' Tor.
       checks = lib.genAttrs (lib.remove "x86_64-windows" systems) (system:
         let
           pkgs = logos-module-builder.inputs.nixpkgs.legacyPackages.${system};
@@ -60,6 +60,13 @@
             cp -r ${./tests} tests
             $CXX -std=c++17 -Wall -Wextra -Werror -I${pkgs.nlohmann_json}/include -o private_sends tests/private_sends_test.cpp
             ./private_sends > $out
+          '';
+          # Following Tor's SOCKS port with mocked tor_module events, and the restart's carry-over.
+          tor-follow = pkgs.runCommandCC "bitcoind-module-tor-follow" { } ''
+            cp -r ${./src} src
+            cp -r ${./tests} tests
+            $CXX -std=c++17 -Wall -Wextra -Werror -I${pkgs.nlohmann_json}/include -o tor_follow tests/tor_follow_test.cpp
+            ./tor_follow > $out
           '';
           private-broadcast = privateBroadcast "proxy";
           private-broadcast-tor = privateBroadcast "tor";

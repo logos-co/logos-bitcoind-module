@@ -1,6 +1,5 @@
 #pragma once
 
-#include <mutex>
 #include <string>
 
 #include <nlohmann/json.hpp>
@@ -61,21 +60,5 @@ inline TorSocks torSocksFrom(const std::string& statusReply) {
     if (t.socks.empty()) t.why = "Tor's SOCKS port is not one Core can use: " + v["socks"].get<std::string>();
     return t;
 }
-
-// Logos' Tor SOCKS port as tor_module last answered ok.
-struct TorSeen {
-    std::mutex mutex;
-    bool known = false;
-    std::string socks;  // IP:PORT; "" when off or unusable
-    std::string why;
-
-    void note(const TorSocks& t) {
-        if (!t.answered) return;
-        std::lock_guard<std::mutex> lock(mutex);
-        known = true;
-        socks = t.socks;
-        why = t.why;
-    }
-};
 
 }  // namespace private_sends

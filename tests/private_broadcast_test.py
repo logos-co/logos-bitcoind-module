@@ -334,6 +334,36 @@ def main():
     assert len(pending) == 1 and len(pending[0]["peers"]) >= NUM_PRIVATE_BROADCAST_PER_TX, pending
     node.stop()
 
+    if tor:
+        # What the module's automatic restart relies on (src/carry_over.h): a restart forgets the
+        # pending private broadcasts, the same hex is taken again, and a mined or spent one is refused.
+        state["watcher"], _ = clearnet_watcher(watcher_port)
+        node = Node("originator", args.lib, argv)
+        wallet = MiniWallet(node)
+        assert node.getprivatebroadcastinfo()["transactions"] == [], "a restart forgets pending private broadcasts"
+        held = pending[0]["hex"]
+        assert node.sendrawtransaction(held, 0, 21000000) == tx["txid"]
+        assert [t["txid"] for t in node.getprivatebroadcastinfo()["transactions"]] == [tx["txid"]]
+        assert tx["txid"] not in node.getrawmempool(), "sent again privately, still out of the mempool"
+        node.generateblock(wallet.get_address(), [held])
+        try:
+            node.sendrawtransaction(held, 0, 21000000)
+            raise AssertionError("a mined transaction was taken again")
+        except RPCError as e:
+            assert "'code': -27" in str(e), e
+        wallet.rescan_utxos()
+        utxo = wallet.get_utxo()
+        spent = wallet.create_self_transfer(utxo_to_spend=utxo)
+        rival = wallet.create_self_transfer(utxo_to_spend=utxo, fee_rate=decimal.Decimal("0.01"))
+        node.generateblock(wallet.get_address(), [rival["hex"]])
+        try:
+            node.sendrawtransaction(spent["hex"], 0, 21000000)
+            raise AssertionError("a double spend was taken again")
+        except RPCError as e:
+            assert "'code': -25" in str(e) and "missingorspent" in str(e), e
+        print("restart: the queue was empty; the held transaction was taken again; mined -27, spent -25")
+        node.stop()
+
     # Control: the same flags without -privatebroadcast. The existing peer hears of the next one.
     state["watcher"] = None
     if tor:
