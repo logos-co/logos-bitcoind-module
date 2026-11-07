@@ -9626,7 +9626,8 @@
     "root": {
       "inputs": {
         "logos-bitcoin-core-nix": "logos-bitcoin-core-nix",
-        "logos-module-builder": "logos-module-builder"
+        "logos-module-builder": "logos-module-builder",
+        "tor_module": "tor_module"
       }
     },
     "rust-overlay": {
@@ -9697,6 +9698,26 @@
       "original": {
         "owner": "oxalica",
         "repo": "rust-overlay",
+        "type": "github"
+      }
+    },
+    "tor_module": {
+      "inputs": {
+        "logos-module-builder": [
+          "logos-module-builder"
+        ]
+      },
+      "locked": {
+        "lastModified": 1793890854,
+        "narHash": "sha256-muOOOPaCRrDVx8mKRu2k93ISZK3CwVhpr/VUa63E9qQ=",
+        "owner": "logos-co",
+        "repo": "logos-tor-module",
+        "rev": "8a2ff25e6229293431293d31ed50b3f3bc1dfebc",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-tor-module",
         "type": "github"
       }
     }

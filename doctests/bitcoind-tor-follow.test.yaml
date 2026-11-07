@@ -1,0 +1,140 @@
+name: bitcoind_module — a signet node follows Logos' Tor when its SOCKS port moves
+project_name: logos-bitcoind-module
+
+# The module builds from this checkout (E2E_REPO, set by run.sh); logosctl and tor_module from
+# GitHub. The steps share one working directory, doctests/outputs. POSIX sh.
+#
+# Signet, where privateSends is on by default; regtest never restarts on its own. The node runs
+# about half a minute in all and is then stopped, so it fetches headers and a few blocks, not a
+# chain. tor_module joins the real Tor network once bitcoind_module asks it (a few MB).
+#
+# Only the Tor app may move Tor's port: callers.json in tor_module's instance directory admits
+# this shell (`allowHost`), as tor_module's README describes for tests.
+
+intro: |
+  Core reads `-onion` once, at start. bitcoind_module follows tor_module's `status_changed`
+  events instead, and restarts the node on its own when Tor's SOCKS port moves, about 3 s after
+  it settles. A closed port is waited for, never restarted on.
+
+sections:
+  - title: "Build the module, Tor and the runtime"
+    steps:
+      - title: "Build and stage bitcoind_module and tor_module"
+        run: |
+          set -eu
+          nix build 'github:logos-co/logos-logoscore-cli{release}#ctl-bundle-dir' --out-link ./logos
+          nix build "git+file://${E2E_REPO:?run this spec through doctests/run.sh}#install-portable" -o result-bitcoind
+          nix build 'github:logos-co/logos-tor-module{release}#install-portable' --no-write-lock-file -o result-tor
+          mkdir -p tree/modules
+          cp -rL result-bitcoind/modules/* result-tor/modules/* tree/modules/
+          chmod -R u+w tree
+          ls tree/modules
+        expect_contains: ["bitcoind_module", "tor_module"]
+
+  - title: "Follow Tor's SOCKS port"
+    steps:
+      - title: "Tor's port moves, closes, reopens, and tor_module reloads, while a signet node runs"
+        run: |
+          set -eu
+          export LOGOSCTL_CONFIG_DIR="$PWD/session"
+          rm -rf "$LOGOSCTL_CONFIG_DIR" chain; mkdir -p "$LOGOSCTL_CONFIG_DIR" home chain
+          ctl() { ./logos/bin/logosctl "$@"; }
+          brief() { python3 -c 'import json,sys; v=json.load(sys.stdin)["result"]; print(json.dumps({k: v.get(k) for k in ("state", "uptimeSecs", "privateSends", "privateSendsReason", "privateSendsCarried", "privateSendsCarryError")}))'; }
+          # Polls status() until it contains $1, for up to $2 seconds; prints the last status.
+          until_status() {
+            i=0
+            while :; do
+              s=$(ctl call bitcoind_module status | brief)
+              case "$s" in *"$1"*) echo "$s"; return 0;; esac
+              i=$((i + 1)); [ $i -lt $(($2 * 4)) ] || { echo "timed out waiting for $1: $s"; return 1; }
+              sleep 0.25
+            done
+          }
+          # The -onion the running node was started with, from its debug.log.
+          onion() { ctl call bitcoind_module logTail 5000 | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"])' | grep -o 'Command-line arg: onion=[^ ]*' | tail -1; }
+          printf 'modules_dirs: [%s]\n' "$PWD/tree/modules" | ctl daemon config set - > /dev/null
+          HOME="$PWD/home" ctl daemon start --detach
+          # The next step goes on with this daemon; a failure here stops it.
+          ok=0; trap '[ $ok = 1 ] || ctl daemon stop > /dev/null 2>&1 || true' EXIT
+          ctl module load tor_module
+          tor_dir=$(ls -d session/data/tor_module/*/ | head -1)
+          printf '{"allowHost":true}' > "$tor_dir/callers.json"
+          ctl module unload tor_module; sleep 1; ctl module load tor_module
+          set -- $(python3 -c 'import socket
+          s = [socket.socket() for _ in range(2)]
+          for x in s: x.bind(("127.0.0.1", 0))
+          print(*[x.getsockname()[1] for x in s])')
+          A=$1; B=$2
+          ctl call tor_module set_socks true "127.0.0.1:$A" > /dev/null
+          ctl module load bitcoind_module
+          ctl call bitcoind_module configure signet "json:{\"dataDir\":\"$PWD/chain\"}" > /dev/null
+          ctl call bitcoind_module start signet > /dev/null
+          echo "== started"; until_status '"privateSends": "on"' 30; onion | sed "s/$A/A/"
+
+          ctl call tor_module set_socks true "127.0.0.1:$B" > /dev/null
+          echo "== Tor moved to B"; until_status '"privateSends": "restart"' 10 | sed "s/$B/B/g"
+          until_status '"privateSends": "on"' 30 > /dev/null
+          until_status '"state": "running"' 30 | sed "s/$B/B/g"; onion | sed "s/$B/B/"
+          sed "s/$B/B/g; s/^[^ ]* //" "$(ls -d session/data/bitcoind_module/*/ | head -1)/tor-follow.log"
+
+          ctl call tor_module set_socks false "127.0.0.1:$B" > /dev/null
+          echo "== Tor's port closed"; until_status '"privateSends": "waiting"' 10
+          sleep 6
+          ctl call bitcoind_module status | python3 -c 'import json,sys; v=json.load(sys.stdin)["result"]; print("still running, no restart:", v["state"] == "running" and v["uptimeSecs"] >= 6)'
+          ctl call tor_module set_socks true "127.0.0.1:$B" > /dev/null
+          echo "== reopened at B"; until_status '"privateSends": "on"' 10 > /dev/null
+          ctl call bitcoind_module status | python3 -c 'import json,sys; v=json.load(sys.stdin)["result"]; print("on again, same run:", v["privateSends"] == "on" and v["uptimeSecs"] >= 6)'
+
+          ctl module unload tor_module
+          echo "== tor_module unloaded"; until_status '"privateSends": "waiting"' 10
+          ctl module load tor_module
+          echo "== loaded again, at B as saved"; until_status '"privateSends": "on"' 20 > /dev/null
+          ctl call bitcoind_module status | python3 -c 'import json,sys; v=json.load(sys.stdin)["result"]; print("on again, same run:", v["privateSends"] == "on" and v["uptimeSecs"] >= 6)'
+          echo "automatic restarts: $(wc -l < "$(ls -d session/data/bitcoind_module/*/ | head -1)/tor-follow.log" | tr -d ' ')"
+          ctl call bitcoind_module stop > /dev/null
+          ok=1
+        expect_contains:
+          - '"privateSends": "on"'
+          - 'Command-line arg: onion="127.0.0.1:A"'
+          - '"privateSends": "restart", "privateSendsReason": "Tor moved to 127.0.0.1:B; the node restarts in a few seconds to use it"'
+          - 'Command-line arg: onion="127.0.0.1:B"'
+          - 'automatic restart (Tor moved to 127.0.0.1:B; the node is restarting to use it): privateSends on; 0 pending private broadcast(s) read; 0 to send again'
+          - '"privateSends": "waiting", "privateSendsReason": "Tor''s SOCKS port is off"'
+          - 'still running, no restart: True'
+          - '"privateSends": "waiting", "privateSendsReason": "tor_module stopped"'
+          - 'on again, same run: True'
+          - 'automatic restarts: 1'
+
+      - title: "Started without a SOCKS port; Tor opens one, and the node restarts into private sends"
+        run: |
+          set -eu
+          export LOGOSCTL_CONFIG_DIR="$PWD/session"
+          ctl() { ./logos/bin/logosctl "$@"; }
+          brief() { python3 -c 'import json,sys; v=json.load(sys.stdin)["result"]; print(json.dumps({k: v.get(k) for k in ("state", "privateSends", "privateSendsReason")}))'; }
+          until_status() {
+            i=0
+            while :; do
+              s=$(ctl call bitcoind_module status | brief)
+              case "$s" in *"$1"*) echo "$s"; return 0;; esac
+              i=$((i + 1)); [ $i -lt $(($2 * 4)) ] || { echo "timed out waiting for $1: $s"; return 1; }
+              sleep 0.25
+            done
+          }
+          trap 'ctl daemon stop > /dev/null 2>&1 || true' EXIT
+          A=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+          ctl call tor_module set_socks false "127.0.0.1:$A" > /dev/null
+          ctl call bitcoind_module start signet > /dev/null
+          echo "== started"; until_status '"state": "running"' 30
+          ctl call tor_module set_socks true "127.0.0.1:$A" > /dev/null
+          echo "== Tor opened its port"; until_status '"privateSends": "restart"' 10 | sed "s/$A/A/g"
+          until_status '"privateSends": "on"' 30 > /dev/null
+          until_status '"state": "running"' 30
+          ctl call bitcoind_module logTail 5000 | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"])' | grep -o 'Command-line arg: onion=[^ ]*' | tail -1 | sed "s/$A/A/"
+          ctl call bitcoind_module stop > /dev/null
+          ctl module unload bitcoind_module
+          ctl daemon stop
+        expect_contains:
+          - '"privateSends": "unavailable", "privateSendsReason": "Tor''s SOCKS port is off"'
+          - '"privateSends": "restart", "privateSendsReason": "Tor opened its SOCKS port at 127.0.0.1:A; the node restarts in a few seconds to send over it"'
+          - '"state": "running", "privateSends": "on"'
+          - 'Command-line arg: onion="127.0.0.1:A"'

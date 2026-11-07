@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Private broadcast with bitcoind_module's own flags for a proxy (tests/print_argv): Core 31.2
-in-process through libbitcoind_c, under Core's test framework as p2p_private_broadcast.py does. A
-SOCKS5 proxy sends the first private broadcast connection to a second regtest node and every other
-connection to a recording peer, the -addnode included. README, "Private broadcast".
+"""Private broadcast with bitcoind_module's own flags (tests/print_argv): Core 31.2 in-process
+through libbitcoind_c, under Core's test framework as p2p_private_broadcast.py does. A SOCKS5 proxy
+sends the first private broadcast connection to a second regtest node and every other connection to
+a recording peer. README, "Private broadcast".
+
+--mode proxy: the user's proxy (-proxy, -onlynet=onion); the -addnode is an onion peer behind it.
+--mode tor: privateSends with Logos' Tor (-onion only); the -addnode is a clearnet peer the node
+dials directly, as its sync does.
 
   private_broadcast_test.py --lib <libbitcoind_c> --framework <core src>/test/functional \\
-      --print-argv <print_argv> --work <empty dir>
+      --print-argv <print_argv> --work <empty dir> [--mode proxy|tor]
 """
 
 import argparse
@@ -127,7 +131,9 @@ def main():
     ap.add_argument("--framework", required=True)
     ap.add_argument("--print-argv", required=True)
     ap.add_argument("--work", required=True)
+    ap.add_argument("--mode", choices=["proxy", "tor"], default="proxy")
     args = ap.parse_args()
+    tor = args.mode == "tor"
     sys.path.insert(0, args.framework)
     from test_framework.p2p import NetworkThread, P2PInterface, P2P_SERVICES, start_p2p_listener
     from test_framework.socks5 import start_socks5_server
@@ -161,11 +167,27 @@ def main():
                 self.announced.add(i.hash)
             super().on_inv(message)
 
-    def listener():
+    def recorder():
         p = Recorder()
         p.peer_connect_helper(dstaddr="0.0.0.0", dstport=0, net="regtest", timeout_factor=1)
         p.peer_connect_send_version(services=P2P_SERVICES)
+        return p
+
+    def listener():
+        p = recorder()
         return p, start_p2p_listener(network, p)
+
+    def clearnet_watcher(port=0):
+        """A recording peer the node reaches directly, not through the proxy; port 0 picks one."""
+        p = recorder()
+        got = []
+        network.listen(p, lambda a, pt: got.append(pt), port=port, addr="127.0.0.1")
+        wait_until("the clearnet listener", lambda: got, 10)
+        return p, got[0]
+
+    def print_argv(settings, tor_socks=None):
+        extra = [tor_socks] if tor_socks is not None else []
+        return json.loads(subprocess.check_output([args.print_argv, "regtest", json.dumps(settings)] + extra, text=True))
 
     for d in ("originator", "receiver"):
         os.makedirs(f"{args.work}/{d}", exist_ok=True)
@@ -210,14 +232,40 @@ def main():
             return {"actual_to_addr": host, "actual_to_port": p}
 
     proxy = start_socks5_server(destinations)
+    socks = f"{proxy.conf.addr[0]}:{proxy.conf.addr[1]}"
     settings = {"dataDir": f"{args.work}/originator", "pruneMiB": 550, "dbcacheMiB": 0, "maxMempoolMiB": 300,
-                "proxy": f"{proxy.conf.addr[0]}:{proxy.conf.addr[1]}", "logCategories": ["net", "privatebroadcast"],
-                "exposeRpc": False, "addNodes": [f"{peer_onion}:18444"]}
-    argv = json.loads(subprocess.check_output([args.print_argv, "regtest", json.dumps(settings)], text=True))
-    for flag in [f"-proxy={settings['proxy']}", "-onlynet=onion", "-privatebroadcast", "-listen=0", f"-addnode={peer_onion}:18444"]:
+                "proxy": socks, "logCategories": ["net", "privatebroadcast"],
+                "exposeRpc": False, "addNodes": [f"{peer_onion}:18444"], "privateSends": False}
+    if tor:
+        # privateSends with Logos' Tor at `socks`: the module's other cases first, flags only.
+        settings["proxy"] = ""
+        settings["privateSends"] = True
+        for case, s, t in [("unavailable", settings, ""), ("off", {**settings, "privateSends": False}, socks)]:
+            a = print_argv(s, t)
+            assert not [f for f in a if f.startswith(("-onion", "-proxy", "-onlynet", "-privatebroadcast"))], f"{case}: {a}"
+        a = print_argv({**settings, "proxy": "127.0.0.1:9050"}, socks)
+        assert "-proxy=127.0.0.1:9050" in a and "-onlynet=onion" in a and "-privatebroadcast" in a, a
+        assert not [f for f in a if f.startswith("-onion")], f"a proxy keeps its own flags: {a}"
+        watcher, watcher_port = clearnet_watcher()
+        state["watcher"] = watcher
+        settings["addNodes"] = [f"127.0.0.1:{watcher_port}"]
+        argv = print_argv(settings, socks)
+        expected = [f"-onion={socks}", "-privatebroadcast", "-listen=0", f"-addnode=127.0.0.1:{watcher_port}"]
+        assert not [f for f in argv if f.startswith(("-proxy", "-onlynet"))], f"privateSends adds no -proxy or -onlynet: {argv}"
+    else:
+        argv = print_argv(settings)
+        expected = [f"-proxy={socks}", "-onlynet=onion", "-privatebroadcast", "-listen=0", f"-addnode={peer_onion}:18444"]
+    for flag in expected:
         assert flag in argv, f"the module's flags lack {flag}: {argv}"
     print("module flags:", " ".join(argv))
     node = Node("originator", args.lib, argv)
+    if tor:
+        # Onion peers through the proxy; IPv4 and IPv6 reachable and direct, so sync stays clearnet.
+        nets = {n["name"]: n for n in node.getnetworkinfo()["networks"]}
+        assert nets["onion"]["reachable"] and nets["onion"]["proxy"] == socks, nets["onion"]
+        for n in ("ipv4", "ipv6"):
+            assert nets[n]["reachable"] and nets[n]["proxy"] == "", nets[n]
+        print(f"networks: onion through {socks}; ipv4 and ipv6 reachable, direct")
 
     # A chain both nodes hold: mined here, handed over block by block.
     wallet = MiniWallet(node)
@@ -229,7 +277,7 @@ def main():
     for _ in range(20):
         node.addpeeraddress(onion_v3(), 18444)
     wait_until("the -addnode peer", lambda: state["watcher"] is not None and state["watcher"].message_count["verack"] >= 1, 60)
-    print(f"existing peer: {peer_onion} (manual), handshake done")
+    print(f"existing peer: {settings['addNodes'][0]} (manual, {'direct' if tor else 'through the proxy'}), handshake done")
 
     tx = wallet.create_self_transfer()
     txid, wtxid = int(tx["txid"], 16), int(tx["wtxid"], 16)
@@ -264,14 +312,62 @@ def main():
     print(f"no existing connection carried it: {len(others)} peers ({', '.join(types)})")
     live = node.getpeerinfo()
     assert any(p["connection_type"] == "manual" for p in live), "the -addnode peer stays connected"
+    if tor:
+        w = state["watcher"]
+        assert txid not in w.announced and wtxid not in w.announced and w.message_count["tx"] == 0, \
+            "the clearnet -addnode peer heard the transaction"
+        assert not any(d["to"] == "127.0.0.1" for d in dests), "the clearnet peer was reached through the proxy"
+        print(f"nor did the clearnet -addnode peer, connected directly ({w.message_count['verack']} verack)")
+        # Every private broadcast connection the node tried went through the proxy: none direct.
+        def tried():
+            with open(log_path, encoding="utf-8") as f:
+                return {m.group(1) for m in map(re.compile(r".*trying v. connection \(private-broadcast\) to \[?([^\]\s]+?)\]?:\d+,").match, f) if m}
+        def direct():
+            with lock:
+                return tried() - {d["to"] for d in dests if d["type"] == "private-broadcast"}
+        assert tried(), "no private broadcast attempt in the log"
+        wait_until("every private broadcast attempt at the proxy", lambda: not direct(), 15)
+        print(f"all {len(tried())} private broadcast connections went through the proxy")
     wait_until("the private broadcast connections closed",
                lambda: not any(p["connection_type"] == "private-broadcast" for p in node.getpeerinfo()), 60)
     pending = [t for t in node.getprivatebroadcastinfo()["transactions"] if t["txid"] == tx["txid"]]
     assert len(pending) == 1 and len(pending[0]["peers"]) >= NUM_PRIVATE_BROADCAST_PER_TX, pending
     node.stop()
 
+    if tor:
+        # What the module's automatic restart relies on (src/carry_over.h): a restart forgets the
+        # pending private broadcasts, the same hex is taken again, and a mined or spent one is refused.
+        state["watcher"], _ = clearnet_watcher(watcher_port)
+        node = Node("originator", args.lib, argv)
+        wallet = MiniWallet(node)
+        assert node.getprivatebroadcastinfo()["transactions"] == [], "a restart forgets pending private broadcasts"
+        held = pending[0]["hex"]
+        assert node.sendrawtransaction(held, 0, 21000000) == tx["txid"]
+        assert [t["txid"] for t in node.getprivatebroadcastinfo()["transactions"]] == [tx["txid"]]
+        assert tx["txid"] not in node.getrawmempool(), "sent again privately, still out of the mempool"
+        node.generateblock(wallet.get_address(), [held])
+        try:
+            node.sendrawtransaction(held, 0, 21000000)
+            raise AssertionError("a mined transaction was taken again")
+        except RPCError as e:
+            assert "'code': -27" in str(e), e
+        wallet.rescan_utxos()
+        utxo = wallet.get_utxo()
+        spent = wallet.create_self_transfer(utxo_to_spend=utxo)
+        rival = wallet.create_self_transfer(utxo_to_spend=utxo, fee_rate=decimal.Decimal("0.01"))
+        node.generateblock(wallet.get_address(), [rival["hex"]])
+        try:
+            node.sendrawtransaction(spent["hex"], 0, 21000000)
+            raise AssertionError("a double spend was taken again")
+        except RPCError as e:
+            assert "'code': -25" in str(e) and "missingorspent" in str(e), e
+        print("restart: the queue was empty; the held transaction was taken again; mined -27, spent -25")
+        node.stop()
+
     # Control: the same flags without -privatebroadcast. The existing peer hears of the next one.
     state["watcher"] = None
+    if tor:
+        state["watcher"], _ = clearnet_watcher(watcher_port)
     plain = [a for a in argv if a != "-privatebroadcast"]
     node = Node("originator", args.lib, plain)
     wallet = MiniWallet(node)
@@ -287,7 +383,7 @@ def main():
     receiver.stop()
     proxy.stop()
     network.close(timeout=10)
-    print("private broadcast: ok")
+    print(f"private broadcast ({args.mode}): ok")
     return 0
 
 
