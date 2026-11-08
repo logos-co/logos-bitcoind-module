@@ -2,3 +2,4 @@ result
 result-*
 build/
 build-*/
+doctests/outputs/

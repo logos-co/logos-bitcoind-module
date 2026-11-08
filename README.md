@@ -19,7 +19,7 @@ logosctl call bitcoind_module stop
 |---|---|
 | `configure(network, config)` | Merges `config` into the stored settings; refuses unknown keys, wrong types and unknown networks |
 | `getConfig(network)`, `defaultConfig(network)` | The stored settings with defaults filled in; the defaults alone. Empty for an unknown network |
-| `start(network)` | Starts the node and returns once its thread runs |
+| `start(network)` | Starts the node and returns once its thread runs; refused while a node runs |
 | `stop()` | Writes the UTXO cache (state `flushing`), then stops the node and waits for it |
 | `flush()` | Writes the UTXO cache to disk and keeps it in memory |
 | `status()` | Lifecycle and chain state; never waits on the node |
@@ -27,15 +27,24 @@ logosctl call bitcoind_module stop
 | `logTail(lines)` | The last lines of the node's `debug.log` |
 
 Event: `bitcoindStateChanged(payloadJson)` on every lifecycle transition (`stopped`,
-`starting`, `running`, `flushing`, `stopping`, `failed`), with `status()`'s shape.
+`starting`, `running`, `flushing`, `stopping`, `failed`) and every change of `privateSends`, with
+`status()`'s shape.
 
 Networks are `mainnet`, `testnet4`, `signet` and `regtest`.
+
+`tor_module` is an optional dependency: a start asks it for its SOCKS port when the node is to send
+its transactions over Tor, and the module follows its `status_changed` events while the node runs
+([Private sends](#private-sends-through-logos-tor)).
 
 `status()` carries `state`, `network`, `version`, `uptimeSecs`, `lastError`, and from Core's
 RPC `blocks`, `headers`, `verificationProgress`, `initialSync`, `peersOut`, `pruneHeight`
 (0 on an unpruned node), `filterIndexHeight`, `tipAgeSecs` (the tip block's timestamp against
 the clock) and `sizeOnDisk`, and `dbcacheMiB`, the cache the node was started with (0 for
 Core's default). Numbers are -1 until known and while the node is not running.
+`privateSends` says what the node does with its own transactions now, and `privateSendsReason`
+why when that is `unavailable`, `waiting` or `restart`; `privateSendsCarried`,
+`privateSendsCarryIgnored` and `privateSendsCarryError` say what the last automatic restart did
+with the private broadcasts it found pending ([below](#following-tors-port)).
 A thread samples the node every second, so `status()` never waits on Core's locks; `state`
 itself is read live.
 
@@ -57,8 +66,9 @@ authorized, otherwise), and only for these methods (`-32601` otherwise; `src/rpc
 `getblockfilter`, `getblockfrompeer`, `getrawmempool`, `getmempoolentry`, `getrawtransaction`,
 `sendrawtransaction`, `estimatesmartfee`, `getnetworkinfo`, `getpeerinfo`. The wallet core's
 filter restore reads `getblockfilter` and fetches a pruned block it needs with
-`getblockfrompeer`, which asks one of the node's own peers: those connections follow the node's
-proxy setting (`-proxy`, `-onlynet=onion`), so nothing leaves outside it. `getrawtransaction`
+`getblockfrompeer`, which asks one of the node's own peers: with a proxy every peer is an onion
+service behind it (`-proxy`, `-onlynet=onion`), so nothing leaves outside it; without one the
+peer may be a clearnet one, as for the node's sync. `getrawtransaction`
 serves the mempool's transactions, and a block's with its hash.
 On regtest, for the wallet's end-to-end tests, the same callers may also mine with
 `generatetoaddress` and `generateblock`; they are refused on every other network, judged by the
@@ -80,7 +90,8 @@ Per network, persisted in the instance directory (`bitcoind.json`).
 | `pruneMiB` | `2048` mainnet, `550` elsewhere | MiB of recent blocks kept; `0` keeps every block. Core's minimum is 550 |
 | `dbcacheMiB` | `0` | UTXO cache during initial sync; `0` leaves Core's default for the machine's memory. See below |
 | `maxMempoolMiB` | `300` | |
-| `proxy` | `""` | Tor's SOCKS address. Set, it adds `-proxy`, `-onlynet=onion` and `-privatebroadcast` |
+| `proxy` | `""` | Tor's SOCKS address. Set, it adds `-proxy`, `-onlynet=onion` and `-privatebroadcast`, whatever `privateSends` says |
+| `privateSends` | `true`, `false` on regtest | With no `proxy`: the node's own transactions over Logos' Tor, `-onion=<its SOCKS port>` and `-privatebroadcast`; the node still syncs directly. See below |
 | `logCategories` | `[]` | Core `-debug` categories, such as `["net","mempool"]` |
 | `addNodes` | `[]` | Up to 8 peers to keep a connection to, `host:port` (Core's `-addnode`), such as one's own node |
 | `exposeRpc` | `false` | Opens Core's RPC server on 127.0.0.1 for other programs; see below |
@@ -93,12 +104,21 @@ again, and gets the sync-time cache.
 
 Every start also passes `-blockfilterindex=1`, `-disablewallet`, `-persistmempool=0`,
 `-listen=0` and `-noconf`. Core refuses `-privatebroadcast` when neither Tor nor I2P is
-reachable, so without a proxy (clearnet, or regtest) the node broadcasts the ordinary way.
+reachable, so with neither a proxy nor Logos' Tor (`privateSends` off, as on regtest by default,
+or Tor unavailable) the node broadcasts the ordinary way.
 
 ## Private broadcast
 
-With a proxy, the node runs with `-privatebroadcast` (and `-proxy`, `-onlynet=onion`). What Bitcoin
-Core 31.2 does with it, from its source at the v31.2 tag (241537a):
+The node runs with `-privatebroadcast` in two cases:
+
+- **Through Logos' Tor**, `privateSends` with no `proxy`, the default on mainnet, testnet4 and
+  signet: `-onion=<tor_module's SOCKS port>`, without `-proxy` or `-onlynet`. Tor carries the
+  private broadcast connections and any connection to an onion service; the node syncs over
+  clearnet as before. [Below](#private-sends-through-logos-tor).
+- **Through the user's proxy**, `proxy` set: `-proxy` and `-onlynet=onion`, so every connection
+  goes through the proxy to onion services.
+
+What Bitcoin Core 31.2 does with it, from its source at the v31.2 tag (241537a):
 
 - `sendrawtransaction` leaves the transaction out of the node's mempool and hands it to private
   broadcast (`rpc/mempool.cpp:130`, `node/transaction.cpp:105`). Core's own wallet is not
@@ -137,7 +157,119 @@ mempool and reaches the second node; the other two private connections each get 
 `inv` and the transaction, then close; none of the 11 to 13 existing connections (manual,
 outbound full relay, block relay only, feeler) hears of it. A control run without
 `-privatebroadcast` tells the existing peer. `nix build .#checks.<system>.private-broadcast` runs
-it (about a minute).
+it (about a minute); `private-broadcast-tor` runs the same with Logos' Tor's flags (below).
+
+### Private sends through Logos' Tor
+
+With `privateSends` and no `proxy`, a start asks `tor_module` for its SOCKS port and passes
+`-onion=IP:PORT -privatebroadcast`. What Core 31.2 does with that, from the same source:
+
+- `-onion` alone gives onion services a proxy and keeps them reachable (`init.cpp:1768`, `:1792`).
+  IPv4 and IPv6 stay reachable with no proxy: only `-proxy` sets theirs (`init.cpp:1707`). So the
+  check that Tor or I2P is reachable passes (`init.cpp:2259`), and the node's connections to
+  clearnet peers, for blocks, headers and relay, are made directly, as without Tor.
+- Private broadcast picks onion services, and IPv4 or IPv6 peers through the same Tor proxy once
+  one outbound connection over Tor has completed its handshake (`net.cpp:3102`, `:3161`,
+  `:4116`). It never picks a direct connection.
+- `-proxyrandomize` (on by default, `init.cpp:152`) gives each connection through the onion proxy
+  its own SOCKS credentials (`init.cpp:1786`), and `tor_module` never lets streams with different
+  credentials share a circuit (its README, "The SOCKS port"): each private broadcast connection
+  rides its own circuit.
+- Onion services being reachable, addrman can also pick some for the node's ordinary outbound
+  connections: those go through Tor, the rest over clearnet. The node's clearnet peers still see
+  this computer's IP address running a Bitcoin node; what private broadcast hides is which node a
+  transaction came from, as above.
+
+`tests/private_broadcast_test.py --mode tor` checks it with these flags and an `-addnode` the
+node reaches directly, as a clearnet peer: Core starts with them; `getnetworkinfo` shows onion
+services through the proxy and IPv4 and IPv6 direct; the transaction stays out of the mempool and
+reaches the second node through the proxy; the other two private connections get the bare
+version, `inv` and the transaction; neither the direct peer nor the automatic connections to
+onion services through the proxy (10 and 11 in two runs on 2026-11-06) hear of it; and every private
+broadcast connection in the node's log went through the proxy. The control run without
+`-privatebroadcast` tells the direct peer. No test reaches an IPv4 peer through Tor: a routable
+IPv4 address in addrman would also be dialled directly, by the node's sync.
+
+**Logos' Tor and its SOCKS port.**
+
+- A start asks `tor_module.status()` only when it would use the answer, since asking starts an
+  idle Tor. Its `socks`, `socks5h://IP:PORT`, becomes `-onion=IP:PORT`. The module waits up to
+  2 s for it.
+- When `tor_module` is not loaded, does not answer, answers an error, or has no SOCKS port (the
+  user turned it off in the Tor app), the node starts without private sends and broadcasts the
+  ordinary way: `status()` says `privateSends: "unavailable"` and why. A later start asks again.
+- Core reads `-onion` once, at start, so the module follows Tor's port while the node runs and
+  restarts the node on its own when it moves ([below](#following-tors-port)).
+
+`status().privateSends`, for the node that runs now:
+
+| Value | |
+|---|---|
+| `on` | Private broadcast through Logos' Tor |
+| `proxy` | Private broadcast through the user's proxy |
+| `off` | `privateSends` off and no proxy: the ordinary way |
+| `unavailable` | `privateSends` on, but Logos' Tor had no SOCKS port to give at start: the ordinary way. `privateSendsReason` says why |
+| `waiting` | Started `on`, but Tor's SOCKS port has since closed, or `tor_module` went away: private broadcasts wait for it, none goes out directly. Also a port that moved when the node does not follow it (below), until the next start |
+| `restart` | An automatic restart to Tor's new port is pending or under way. `privateSendsReason` says so, such as `Tor moved to 127.0.0.1:9251; the node restarts in a few seconds to use it` |
+| `""` | No node running (`stopped` or `failed`) |
+
+### Following Tor's port
+
+`tor_module` emits `status_changed` with its `status()` reply whenever its state, progress or SOCKS
+port changes. The module subscribes when it loads; the subscription arms when `tor_module` loads,
+then or later, and again after it reloads. Only the `socks` field matters here.
+
+- **The port moved** while the node runs `on` (another chosen in the Tor app, or a restarted Tor
+  that found 9250 taken): the node restarts on its own with the new `-onion`, 3 s after the port
+  last changed, so a reconnect or a close-and-reopen gives one restart. At most one automatic
+  restart runs a minute; one that comes due inside that minute runs when it ends. Meanwhile
+  `status()` says `restart`.
+- **The port closed** (`socks` null, or the subscription lost, as unloading `tor_module` closes
+  its port without an event): no restart, which would start the node without Tor and send the
+  ordinary way. `status()` says `waiting`. Back at the same address it needs nothing, Core's
+  `-onion` reaches it again; at another address it is a move.
+- **Started `unavailable`** (no `tor_module`, or no port) and Tor later opens one: the node
+  restarts into `on`, by the same rules.
+- Only while the node runs because `start()` put it there, with private sends through Logos' Tor
+  in effect: not with a `proxy`, not once the settings no longer ask for private sends, not on
+  regtest, and never while a start or stop is under way. A `stop()` ends it; a `start()` begins a
+  fresh minute.
+- Events sent before the subscription arms are lost, so each arm asks `status()` once, as does
+  every 30 s while the node follows Tor; an answer older than an event is dropped. The callbacks
+  only record what they saw: the restart runs on the module's own thread, and asks `tor_module`
+  asynchronously, with a timeout.
+- `tor-follow.log` in the instance directory has a line for each automatic restart and
+  carry-over, with counts and reasons, never a transaction.
+
+**What a restart costs.** Core keeps transactions waiting for private broadcast in memory only:
+`PeerManagerImpl::m_tx_for_private_broadcast` (`net_processing.cpp:1096`), a map in
+`PrivateBroadcast` (`private_broadcast.h:216`), outside the mempool and never on disk. A stop
+forgets them, and with `-privatebroadcast` the wallet's `requested` send reaches the network only
+through that queue. A send made just before the port moved has had its connections fail at the
+old port, so it is still pending when the restart stops the node. A restart also drops the
+node's peers and costs a stop, with its UTXO cache write, and a start: on a fresh signet node the
+new one had loaded within the same second.
+
+So the automatic restart carries them over. Just before its stop it reads them with
+`getprivatebroadcastinfo` (`rpc/mempool.cpp:147`, which returns each one's raw `hex`) and keeps
+them in memory; once the new node runs and answers, it sends each again with
+`sendrawtransaction`, with no fee or burn cap since Core took it once already. Core checks each
+again first (`node/transaction.cpp:75`): one mined meanwhile answers -27, one whose inputs were
+spent -25, one the mempool now rejects -26. Those are counted in `privateSendsCarryIgnored` and
+logged, not sent. The rest count in `privateSendsCarried`. One that still fails (the queue full,
+-37), or a read that failed, is in `privateSendsCarryError`, and the restart runs anyway. A
+restart that comes back without Tor (`unavailable`) holds them for the next automatic restart
+that reaches it, rather than send them the ordinary way. While the restart runs, `rpc()` refuses
+`sendrawtransaction` with -28, `the node is restarting to follow Tor's SOCKS port; send again in
+a few seconds`, and lets a send already under way finish before the read.
+
+This covers the module's own automatic restart only. A send pending when the user stops the
+node, when the module unloads, or when the node crashes, is still lost: Core keeps no copy, and
+neither does the module.
+
+`tests/private_broadcast_test.py --mode tor` checks what this relies on against Core 31.2: after
+a restart `getprivatebroadcastinfo` is empty, the same hex is taken again and queued privately,
+and once mined it answers -27, once its inputs are spent -25.
 
 ## Exposing the node to other programs
 
@@ -166,6 +298,33 @@ At the tip the final flush takes milliseconds. What used to hold a stop up was C
 connection threads: a `connect()` in flight waited out `-timeout` (5 s) before `Shutdown` could
 join them. logos-bitcoin-core-nix's patch 0005 makes that wait interruptible, so a stop cuts it
 short; over Tor the wait is the SOCKS5 handshake, which Core already interrupts.
+
+## Verified, 2026-11-06: following Tor's port
+
+`doctests/run.sh`, a signet node under logosctl (portable bundle) with `tor_module` from GitHub,
+macOS aarch64, HOME isolated:
+
+- `set_socks` to another port while the node runs: `restart`, `Tor moved to 127.0.0.1:<B>; the
+  node restarts in a few seconds to use it`, then `on` again with `-onion=127.0.0.1:<B>` in
+  Core's log, and one line in `tor-follow.log` (0 pending private broadcasts read).
+- Port turned off: `waiting`, `Tor's SOCKS port is off`, and no restart in 6 s; on again at the
+  same port: `on`, same run. `tor_module` unloaded: `waiting`, `tor_module stopped`; loaded
+  again: `on`, same run. One automatic restart in all.
+- Started with the port off: `unavailable`; port opened: `restart`, `Tor opened its SOCKS port
+  at 127.0.0.1:<A>; ...`, then `on` with `-onion=127.0.0.1:<A>`.
+
+## Verified, 2026-11-06
+
+Private sends in a real `logos_host` under logosctl (portable bundle, pre-release 66d098d), macOS
+aarch64, HOME isolated, regtest with `privateSends` configured on:
+
+- Without `tor_module`: `unavailable`, `tor_module is not loaded`, running 2.0 s after `start`
+  (the ask's timeout); Core's log shows no `-onion` and no `-privatebroadcast`.
+- With `tor_module` loaded (9250 was taken, so it listened on another loopback port): `on`,
+  running 0.25 s after `start`, Core's log shows `-onion=127.0.0.1:<that port>` and
+  `-privatebroadcast`.
+- SOCKS port turned off, then a new start: `unavailable`, `Tor's SOCKS port is off`, no Tor
+  flags. After `stop`: `""`.
 
 ## Verified, 2026-10-10
 
@@ -211,4 +370,8 @@ of LevelDB, secp256k1, crc32c, minisketch and libevent as `NOTICES.bitcoind_c`.
 nix build .#install    # result/modules/bitcoind_module: the plugin and libbitcoind_c
 nix build .#checks.aarch64-darwin.rpc-allowlist   # rpc()'s allowlist, on its own
 nix build .#checks.aarch64-darwin.private-broadcast   # private broadcast with the module's flags
+nix build .#checks.aarch64-darwin.private-broadcast-tor   # the same through Logos' Tor (privateSends)
+nix build .#checks.aarch64-darwin.private-sends   # tor_module's reply, the modes and their flags
+nix build .#checks.aarch64-darwin.tor-follow   # following Tor's port, with mocked events; the carry-over
+doctests/run.sh   # a signet node under logosctl follows tor_module's port (about a minute)
 ```

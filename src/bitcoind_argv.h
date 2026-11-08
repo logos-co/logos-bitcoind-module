@@ -5,14 +5,17 @@
 
 #include <nlohmann/json.hpp>
 
+#include "private_sends.h"
 #include "rpc_allowlist.h"
 
 // The flags the module starts Core with, from one network's settings. Header-only, so a test
 // starts Core with exactly these (tests/print_argv.cpp).
 namespace bitcoind_argv {
 
-// The plan's defaults: pruned with filters, no wallet, no listener, Tor only with a proxy.
-inline nlohmann::json argvFor(const std::string& network, const nlohmann::json& s, int64_t dbcacheMiB) {
+// The plan's defaults: pruned with filters, no wallet, no listener, Tor only with a proxy or
+// for private sends. `torSocks` is Logos' Tor SOCKS port as IP:PORT, "" when there is none.
+inline nlohmann::json argvFor(const std::string& network, const nlohmann::json& s, int64_t dbcacheMiB,
+                              const std::string& torSocks = "") {
     using json = nlohmann::json;
     json argv = json::array();
     if (network != "mainnet") argv.push_back("-" + network);
@@ -28,11 +31,15 @@ inline nlohmann::json argvFor(const std::string& network, const nlohmann::json& 
     for (const json& n : s["addNodes"]) argv.push_back("-addnode=" + n.get<std::string>());
     argv.push_back("-maxmempool=" + std::to_string(s["maxMempoolMiB"].get<int64_t>()));
     for (const json& c : s["logCategories"]) argv.push_back("-debug=" + c.get<std::string>());
-    const std::string proxy = s["proxy"].get<std::string>();
-    if (!proxy.empty()) {
-        argv.push_back("-proxy=" + proxy);
+    const std::string mode = private_sends::modeFor(s, torSocks);
+    if (mode == "proxy") {
+        argv.push_back("-proxy=" + s["proxy"].get<std::string>());
         argv.push_back("-onlynet=onion");
         // Core refuses private broadcast without Tor or I2P, so it rides on the proxy.
+        argv.push_back("-privatebroadcast");
+    } else if (mode == "on") {
+        // Tor for onion peers alone, which makes private broadcast possible; sync stays direct.
+        argv.push_back("-onion=" + torSocks);
         argv.push_back("-privatebroadcast");
     }
     if (s["exposeRpc"].get<bool>()) {
