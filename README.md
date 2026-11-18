@@ -60,8 +60,8 @@ or object, or `""` for none. The answer is Core's reply, `{"result":…,"error":
 `{"result":null,"error":{"code":…,"message":…}}`; while the node starts Core answers
 `-28` (in warmup) with its init message, and `-9` when the node is not running.
 
-Only `bitcoin_wallet_core_module` and `bitcoin_node_module` may call it (`-32600`, not
-authorized, otherwise), and only for these methods (`-32601` otherwise; `src/rpc_allowlist.h`):
+Every module may call it, and so may the host (`logosctl call`), but only for these methods
+(`-32601` otherwise; `src/rpc_allowlist.h`):
 `getblockchaininfo`, `getblockcount`, `getblockhash`, `getblockheader`, `getblock`,
 `getblockfilter`, `getblockfrompeer`, `getrawmempool`, `getmempoolentry`, `getrawtransaction`,
 `sendrawtransaction`, `estimatesmartfee`, `getnetworkinfo`, `getpeerinfo`. The wallet core's
@@ -70,15 +70,9 @@ filter restore reads `getblockfilter` and fetches a pruned block it needs with
 service behind it (`-proxy`, `-onlynet=onion`), so nothing leaves outside it; without one the
 peer may be a clearnet one, as for the node's sync. `getrawtransaction`
 serves the mempool's transactions, and a block's with its hash.
-On regtest, for the wallet's end-to-end tests, the same callers may also mine with
+On regtest, for the wallet's end-to-end tests, callers may also mine with
 `generatetoaddress` and `generateblock`; they are refused on every other network, judged by the
 chain Core itself runs.
-
-The check reads the caller identity the host attaches to each call (`logos::currentCaller()`),
-not anything the caller sends. For tests, a `callers.json` in the instance directory replaces
-the caller list: `{"modules":["bitcoin_wallet_core_module"],"allowHost":true}`, where
-`allowHost` admits calls from the host itself, such as `logosctl call`. A file that does not
-parse, or has another key, admits nobody. It is read when the module loads.
 
 ## Settings
 
@@ -331,8 +325,8 @@ aarch64, HOME isolated, regtest with `privateSends` configured on:
 In a real `logos_host` under logosctl, with HOME isolated:
 
 - **macOS** (aarch64, logosctl 0.3.2): the config refusals; regtest running 0.5–0.7 s after
-  `start`; every allowlisted method answers, named parameters included; the host is refused
-  without `callers.json`, `generatetodescriptor` and `stop` always; `stop` in 0.26–0.56 s,
+  `start`; every allowlisted method answers, named parameters included; `generatetodescriptor`
+  and `stop` are refused; `stop` in 0.26–0.56 s,
   restart running in 0.38–0.47 s, unload while running in 0.29–0.37 s (node stop 73–130 ms).
   `exposeRpc`: an owner-only cookie, 200 for a whitelisted method, 403 for another, 401 for a
   wrong or the previous start's cookie; the cookie is gone and the port closed after a stop.
