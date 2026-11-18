@@ -68,9 +68,8 @@ public:
 
     /// One call into Core's RPC table, in-process. `paramsJson` is a JSON array or object
     /// ("" for none). Returns Core's reply, {"result":...,"error":null} or
-    /// {"result":null,"error":{"code":n,"message":s}}. Only bitcoin_wallet_core_module and
-    /// bitcoin_node_module may call it, and only for the allowlisted methods; on regtest also
-    /// generatetoaddress and generateblock.
+    /// {"result":null,"error":{"code":n,"message":s}}. Open to every caller, for the allowlisted
+    /// methods only; on regtest also generatetoaddress and generateblock.
     std::string rpc(const std::string& method, const std::string& paramsJson);
 
     /// The last `lines` lines of the node's debug.log.
@@ -91,8 +90,6 @@ private:
     int64_t cacheFor(const std::string& network, int64_t configured) const;
     void noteTip(int64_t tipAgeSecs);
     void persist();
-    bool admitted();
-    void loadCallers();
     void pollLoop();
     void refresh(const char* forceState = nullptr);
     nlohmann::json sampleChain();
@@ -113,8 +110,6 @@ private:
     std::mutex m_mutex;
     std::string m_persistDir;                            // guarded by m_mutex
     nlohmann::json m_config = nlohmann::json::object();  // guarded by m_mutex
-    std::vector<std::string> m_callerModules;            // guarded by m_mutex
-    bool m_allowHost = false;                            // guarded by m_mutex
     std::string m_network;                               // guarded by m_mutex; the last start's
     std::string m_logFile;                               // guarded by m_mutex; the last start's
     int64_t m_dbcacheMiB = 0;                            // guarded by m_mutex; the last start's, 0 = Core's

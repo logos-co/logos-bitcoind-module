@@ -6,8 +6,6 @@
 #include <filesystem>
 #include <fstream>
 
-#include <logos_caller.h>
-
 #include "logos_sdk.h"
 
 #include "bitcoind_c.h"
@@ -18,8 +16,6 @@ using json = nlohmann::json;
 namespace fs = std::filesystem;
 
 namespace {
-
-const char* const kDefaultCallers[] = {"bitcoin_wallet_core_module", "bitcoin_node_module"};
 
 // During initial sync the cache is written this often, so a stop has little left to flush.
 constexpr auto kSyncFlushInterval = std::chrono::minutes(3);
@@ -140,7 +136,6 @@ void BitcoindModuleImpl::onContextReady() {
             m_state = json::parse(sf, nullptr, false);
             if (!m_state.is_object()) m_state = json::object();
         }
-        loadCallers();
     }
     watchTor();
 }
@@ -161,33 +156,6 @@ void BitcoindModuleImpl::watchTor() {
         if (st == logos::SubStatus::Armed) tor->armed = true;
         else tor_follow::observe(tor->seen, "", "tor_module stopped", steadyMs());
     });
-}
-
-// Absent file: the defaults. Unreadable file: nobody, so a typo never opens the door.
-void BitcoindModuleImpl::loadCallers() {
-    m_callerModules.assign(std::begin(kDefaultCallers), std::end(kDefaultCallers));
-    m_allowHost = false;
-    std::ifstream f(fs::path(m_persistDir) / "callers.json");
-    if (!f) return;
-    m_callerModules.clear();
-    const json c = json::parse(f, nullptr, false);
-    if (!c.is_object()) return;
-    std::vector<std::string> modules;
-    bool allowHost = false;
-    for (auto& [k, v] : c.items()) {
-        if (k == "modules" && v.is_array()) {
-            for (const json& m : v) {
-                if (!m.is_string()) return;
-                modules.push_back(m.get<std::string>());
-            }
-        } else if (k == "allowHost" && v.is_boolean()) {
-            allowHost = v.get<bool>();
-        } else {
-            return;
-        }
-    }
-    m_callerModules = std::move(modules);
-    m_allowHost = allowHost;
 }
 
 bool BitcoindModuleImpl::knownNetwork(const std::string& network) const {
@@ -783,20 +751,11 @@ LogosMap BitcoindModuleImpl::status() {
     return st;
 }
 
-bool BitcoindModuleImpl::admitted() {
-    const logos::LogosCaller caller = logos::currentCaller();
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (caller.isHost()) return m_allowHost;
-    if (!caller.isModule() || caller.name.empty()) return false;
-    return std::find(m_callerModules.begin(), m_callerModules.end(), caller.name) != m_callerModules.end();
-}
-
 std::string BitcoindModuleImpl::rpc(const std::string& method, const std::string& paramsJson) {
-    // Codes from JSON-RPC 2.0: an invalid request, and a method that is not there for us.
-    if (!admitted()) return rpcRefusal(-32600, "not authorized");
     if (m_unloading) return rpcRefusal(-9, "unloading");
     const bitcoind_rpc::Verdict verdict = bitcoind_rpc::classify(method);
     if (verdict != bitcoind_rpc::Verdict::Allowed) {
+        // -32601 is JSON-RPC 2.0's code for a method that is not there.
         if (verdict == bitcoind_rpc::Verdict::Refused)
             return rpcRefusal(-32601, "method not allowed: " + method);
         // The chain Core itself runs, not the network the module was last asked for.
