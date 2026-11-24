@@ -286,7 +286,10 @@ stop path's static `std::once_flag`s, and credentials and whitelists that only a
 
 On unload the node is stopped on a thread and the outcome is written to `unload.log` in the
 instance directory. The host waits up to its grace period (3 s); a node killed after that
-replays its unwritten blocks on the next start, since Core's chainstate is crash-safe.
+replays its unwritten blocks on the next start, since Core's chainstate is crash-safe. The block
+filter index was not after a reorg: its entries could name the other branch and the next start
+failed (#5). logos-bitcoin-core-nix's patch 0006 puts them back at init, and a start that fails
+in init with nothing but log lines now carries Core's last error lines in `lastError`.
 
 At the tip the final flush takes milliseconds. What used to hold a stop up was Core's
 connection threads: a `connect()` in flight waited out `-timeout` (5 s) before `Shutdown` could
