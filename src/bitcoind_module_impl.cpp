@@ -10,6 +10,7 @@
 
 #include "bitcoind_c.h"
 #include "bitcoind_argv.h"
+#include "reset_data.h"
 #include "rpc_allowlist.h"
 
 using json = nlohmann::json;
@@ -705,6 +706,7 @@ void BitcoindModuleImpl::refresh(const char* forceState) {
     s["version"] = st.value("version", "");
     s["uptimeSecs"] = st.value("uptimeSecs", 0);
     s["lastError"] = st.value("lastError", "");
+    s["dataCorrupt"] = s["state"] == "failed" && reset_data::namesCorruption(s["lastError"].get<std::string>());
     { std::lock_guard<std::mutex> lock(m_mutex); s["dbcacheMiB"] = m_dbcacheMiB; }
     const auto ps = privateSendsNow(s["state"].get<std::string>());
     s["privateSends"] = ps.first;
@@ -737,6 +739,7 @@ LogosMap BitcoindModuleImpl::status() {
         st["version"] = "";
         st["uptimeSecs"] = 0;
         st["lastError"] = "";
+        st["dataCorrupt"] = false;
     }
     // An atomic read: the state is never a second stale, even when the rest is.
     const int state = BITCOIND_state();
@@ -744,6 +747,7 @@ LogosMap BitcoindModuleImpl::status() {
     // Not a range-for over chainDefaults().items(): C++17 destroys that temporary before the
     // loop runs, and Windows' heap crashed the host on it while the node was stopped.
     if (state != BITCOIND_RUNNING) st.update(chainDefaults());
+    st["dataCorrupt"] = state == BITCOIND_FAILED && reset_data::namesCorruption(st.value("lastError", ""));
     const auto ps = privateSendsNow(st["state"].get<std::string>());
     st["privateSends"] = ps.first;
     st["privateSendsReason"] = ps.second;
@@ -774,6 +778,46 @@ std::string BitcoindModuleImpl::rpc(const std::string& method, const std::string
     std::string reply = takeString(BITCOIND_rpc(method.c_str(), params));
     --m_sendsInFlight;
     return reply;
+}
+
+// A rename within the parent directory: instant whatever the chain's size, and undone by
+// renaming it back. Under the lifecycle lock, so no start can open the chain meanwhile.
+StdLogosResult BitcoindModuleImpl::resetData(const std::string& network) {
+    if (m_unloading) return fail("unloading");
+    std::lock_guard<std::mutex> lifecycle(m_lifecycleMutex);
+    const int st = BITCOIND_state();
+    if (st == BITCOIND_STARTING || st == BITCOIND_RUNNING || st == BITCOIND_STOPPING)
+        return fail("stop the node first");
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!knownNetwork(network)) return fail("unknown network: " + network);
+    if (m_persistDir.empty()) return fail("no persistence path yet");
+    const json s = settingsFor(network);
+    const fs::path dir = reset_data::chainDir(s["dataDir"].get<std::string>(),
+                                              defaultsFor(network)["dataDir"].get<std::string>(), network);
+    if (dir.empty())
+        return fail("dataDir is set by hand and holds mainnet's chain at its top, next to any other network's; "
+                    "move it aside yourself");
+    std::error_code ec;
+    if (!fs::exists(dir, ec)) return {true, json{{"movedTo", ""}}};
+    std::string stamp = utcNow();
+    stamp.erase(std::remove(stamp.begin(), stamp.end(), ':'), stamp.end());
+    stamp.erase(std::remove(stamp.begin(), stamp.end(), '-'), stamp.end());
+    const fs::path aside = reset_data::asideFor(dir, stamp, [](const fs::path& p) {
+        std::error_code e;
+        return fs::exists(p, e);
+    });
+    fs::rename(dir, aside, ec);
+    if (ec) return fail("could not move " + dir.string() + " aside: " + ec.message());
+    // The next run syncs from scratch, so it gets the sync-time cache again.
+    if (m_state.contains(network)) {
+        m_state.erase(network);
+        const fs::path path = fs::path(m_persistDir) / "bitcoind-state.json";
+        const fs::path tmp = path.string() + ".tmp";
+        { std::ofstream f(tmp); f << m_state.dump(2); }
+        fs::rename(tmp, path, ec);
+    }
+    if (m_network == network) m_logFile.clear();
+    return {true, json{{"movedTo", aside.string()}}};
 }
 
 // Reads backwards from the end, so a long-running node's log costs only the tail.

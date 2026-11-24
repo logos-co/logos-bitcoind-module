@@ -1,0 +1,127 @@
+name: bitcoind_module — a node whose stored chain is damaged resyncs from scratch, its old data moved aside
+project_name: logos-bitcoind-module
+
+# The module builds from this checkout (E2E_REPO, set by run.sh); logosctl from GitHub. The steps
+# share one working directory, doctests/outputs. POSIX sh. Regtest, so the run is offline.
+
+intro: |
+  When Core can't read its stored chain, a start fails and `status()` says so: `lastError` carries
+  Core's init errors and `dataCorrupt` is true. `resetData(network)` is the way out. It moves the
+  network's data directory aside (it deletes nothing), so the next start begins from an empty chain.
+  It refuses while a node runs.
+
+sections:
+  - title: "Build the module and the runtime"
+    steps:
+      - title: "Build and stage bitcoind_module"
+        run: |
+          set -eu
+          nix build 'github:logos-co/logos-logoscore-cli{release}#ctl-bundle-dir' --out-link ./logos
+          nix build "git+file://${E2E_REPO:?run this spec through doctests/run.sh}#install-portable" -o result-bitcoind
+          mkdir -p tree/modules
+          cp -rL result-bitcoind/modules/* tree/modules/
+          chmod -R u+w tree
+          ls tree/modules
+        expect_contains: ["bitcoind_module"]
+
+  - title: "Damage the chain, then resync"
+    steps:
+      - title: "A regtest node with five blocks; resetData refuses while it runs"
+        run: |
+          set -eu
+          export LOGOSCTL_CONFIG_DIR="$PWD/session-resync"
+          rm -rf "$LOGOSCTL_CONFIG_DIR" home-resync; mkdir -p "$LOGOSCTL_CONFIG_DIR" home-resync
+          ctl() { ./logos/bin/logosctl "$@"; }
+          brief() { python3 -c 'import json,sys; v=json.load(sys.stdin)["result"]; print(json.dumps({k: v.get(k) for k in ("state", "blocks", "dataCorrupt")}))'; }
+          until_status() {
+            i=0
+            while :; do
+              s=$(ctl call bitcoind_module status | brief)
+              case "$s" in *"$1"*) echo "$s"; return 0;; esac
+              i=$((i + 1)); [ $i -lt $(($2 * 4)) ] || { echo "timed out waiting for $1: $s"; return 1; }
+              sleep 0.25
+            done
+          }
+          printf 'modules_dirs: [%s]\n' "$PWD/tree/modules" | ctl daemon config set - > /dev/null
+          HOME="$PWD/home-resync" ctl daemon start --detach
+          # The next steps go on with this daemon; a failure here stops it.
+          ok=0; trap '[ $ok = 1 ] || ctl daemon stop > /dev/null 2>&1 || true' EXIT
+          ctl module load bitcoind_module
+          ctl call bitcoind_module start regtest > /dev/null
+          until_status '"state": "running"' 60 > /dev/null
+          ctl call bitcoind_module rpc generatetoaddress '[5, "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"]' > /dev/null
+          until_status '"blocks": 5' 10
+          ctl call bitcoind_module resetData regtest | python3 -c 'import json,sys; r=json.load(sys.stdin)["result"]; print("while running:", r["success"], r["error"])'
+          ctl call bitcoind_module stop > /dev/null
+          until_status '"state": "stopped"' 30
+          ok=1
+        expect_contains:
+          - '"state": "running", "blocks": 5'
+          - 'while running: False stop the node first'
+          - '"state": "stopped"'
+
+      - title: "Damage the block index; the start fails and says the data is corrupt"
+        run: |
+          set -eu
+          export LOGOSCTL_CONFIG_DIR="$PWD/session-resync"
+          ctl() { ./logos/bin/logosctl "$@"; }
+          # status() serves a sample taken every second, so a failed state may lead its lastError.
+          until_corrupt() {
+            i=0
+            while :; do
+              s=$(ctl call bitcoind_module status)
+              case "$s" in *'"dataCorrupt":true'*) break;; esac
+              i=$((i + 1)); [ $i -lt 120 ] || { echo "timed out: $s"; return 1; }
+              sleep 0.25
+            done
+            echo "$s" | python3 -c 'import json,sys; v=json.load(sys.stdin)["result"]; print("state:", v["state"]); print("dataCorrupt:", v["dataCorrupt"]); print("lastError:", v["lastError"].replace("\n", " | "))'
+          }
+          dir=$(ls -d session-resync/data/bitcoind_module/*/regtest)
+          # LevelDB reads CURRENT first to find the index's manifest; garbage there is corruption.
+          printf 'garbage' > "$dir/regtest/blocks/index/CURRENT"
+          ok=0; trap '[ $ok = 1 ] || ctl daemon stop > /dev/null 2>&1 || true' EXIT
+          ctl call bitcoind_module start regtest > /dev/null
+          until_corrupt
+          ok=1
+        expect_contains:
+          - 'state: failed'
+          - 'dataCorrupt: True'
+          - 'Error opening block database.'
+          - 'Please restart with -reindex or -reindex-chainstate to recover.'
+
+      - title: "resetData moves the chain aside; the next start begins from block 0"
+        run: |
+          set -eu
+          export LOGOSCTL_CONFIG_DIR="$PWD/session-resync"
+          ctl() { ./logos/bin/logosctl "$@"; }
+          brief() { python3 -c 'import json,sys; v=json.load(sys.stdin)["result"]; print(json.dumps({k: v.get(k) for k in ("state", "blocks", "dataCorrupt")}))'; }
+          until_status() {
+            i=0
+            while :; do
+              s=$(ctl call bitcoind_module status | brief)
+              case "$s" in *"$1"*) echo "$s"; return 0;; esac
+              i=$((i + 1)); [ $i -lt $(($2 * 4)) ] || { echo "timed out waiting for $1: $s"; return 1; }
+              sleep 0.25
+            done
+          }
+          trap 'ctl daemon stop > /dev/null 2>&1 || true' EXIT
+          inst=$(ls -d session-resync/data/bitcoind_module/*/)
+          moved=$(ctl call bitcoind_module resetData regtest | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["value"]["movedTo"])')
+          echo "moved to: $(basename "$moved" | sed 's/[0-9]\{8\}T[0-9]\{6\}Z/STAMP/')"
+          # Moved, not deleted: the old chain is all there, and its own directory is gone.
+          ls "$moved/regtest/blocks" | grep -c '^blk' | sed 's/^/old block files: /'
+          [ ! -e "$inst/regtest" ] && echo "regtest directory: gone"
+          ctl call bitcoind_module start regtest > /dev/null
+          # The chain fields follow the state by up to a second's sample.
+          until_status '"state": "running", "blocks": 0' 60
+          ctl call bitcoind_module getConfig regtest | python3 -c 'import json,sys; print("settings kept, dataDir:", json.load(sys.stdin)["result"]["dataDir"].endswith("/regtest"))'
+          ctl call bitcoind_module stop > /dev/null
+          until_status '"state": "stopped"' 30 > /dev/null
+          ctl module unload bitcoind_module
+          ctl daemon stop
+        expect_contains:
+          - 'moved to: regtest.reset-STAMP'
+          - 'old block files: 1'
+          - 'regtest directory: gone'
+          - '"state": "running", "blocks": 0, "dataCorrupt": false'
+          - 'settings kept, dataDir: True'

@@ -25,6 +25,7 @@ logosctl call bitcoind_module stop
 | `status()` | Lifecycle and chain state; never waits on the node |
 | `rpc(method, paramsJson)` | One call into Core's RPC table, as a JSON string |
 | `logTail(lines)` | The last lines of the node's `debug.log` |
+| `resetData(network)` | Moves the network's chain aside, so the next start syncs from scratch; refused while a node runs ([below](#resyncing-a-damaged-chain)) |
 
 Event: `bitcoindStateChanged(payloadJson)` on every lifecycle transition (`stopped`,
 `starting`, `running`, `flushing`, `stopping`, `failed`) and every change of `privateSends`, with
@@ -45,6 +46,7 @@ Core's default). Numbers are -1 until known and while the node is not running.
 why when that is `unavailable`, `waiting` or `restart`; `privateSendsCarried`,
 `privateSendsCarryIgnored` and `privateSendsCarryError` say what the last automatic restart did
 with the private broadcasts it found pending ([below](#following-tors-port)).
+`dataCorrupt` is true when a start failed because Core can't read its stored chain or index.
 A thread samples the node every second, so `status()` never waits on Core's locks; `state`
 itself is read live.
 
@@ -291,6 +293,27 @@ filter index was not after a reorg: its entries could name the other branch and 
 failed (#5). logos-bitcoin-core-nix's patch 0006 puts them back at init, and a start that fails
 in init with nothing but log lines now carries Core's last error lines in `lastError`.
 
+### Resyncing a damaged chain
+
+Some damage patch 0006 can't repair, such as a corrupted LevelDB or a pruned node's index that
+needs blocks it has already deleted. Then the start fails, `lastError` carries Core's init errors and
+`dataCorrupt` is true: `lastError` names a corrupted database or index, asks to reindex, or
+says the block database won't load. A lock held by another process, a full disk or a bad
+setting does not count. On a pruned node a reindex would download every block again anyway, so
+the way out is `resetData(network)`:
+
+- It moves the network's chain to `<dir>.reset-<UTC time>` next to it. That is a rename, so it is
+  instant whatever the size, and nothing is deleted. `<dir>` is the module's own `dataDir` for the
+  network, or Core's subdirectory for it (`signet/`, `testnet4/`, `regtest/`) in a `dataDir` set
+  by hand. Mainnet in a `dataDir` set by hand is refused, since Core keeps mainnet at the top
+  level next to the other networks.
+- It refuses while a node starts, runs or stops. Settings stay; the network's "reached the tip"
+  mark is cleared, so the next run gets the sync-time cache.
+- It returns `{"movedTo": path}`, or `""` when there was nothing to move. The old copy is the
+  user's to delete.
+
+The Bitcoin Node app offers this as **Resync this network** when `dataCorrupt` is true.
+
 At the tip the final flush takes milliseconds. What used to hold a stop up was Core's
 connection threads: a `connect()` in flight waited out `-timeout` (5 s) before `Shutdown` could
 join them. logos-bitcoin-core-nix's patch 0005 makes that wait interruptible, so a stop cuts it
@@ -370,5 +393,7 @@ nix build .#checks.aarch64-darwin.private-broadcast   # private broadcast with t
 nix build .#checks.aarch64-darwin.private-broadcast-tor   # the same through Logos' Tor (privateSends)
 nix build .#checks.aarch64-darwin.private-sends   # tor_module's reply, the modes and their flags
 nix build .#checks.aarch64-darwin.tor-follow   # following Tor's port, with mocked events; the carry-over
-doctests/run.sh   # a signet node under logosctl follows tor_module's port (about a minute)
+nix build .#checks.aarch64-darwin.reset-data   # resetData()'s directory and aside name; what reads as corruption
+doctests/run.sh   # a signet node under logosctl follows tor_module's port (about a minute),
+                  # and a regtest node with a damaged block index resyncs (offline, seconds)
 ```
