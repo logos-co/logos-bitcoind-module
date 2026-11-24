@@ -32,7 +32,7 @@
     in
     {
       packages = lib.genAttrs systems (system: module.packages.${system});
-      # rpc()'s allowlist and the pure halves of private sends and Tor following, compiled and run
+      # rpc()'s allowlist, resetData()'s choice of directory, and the pure halves of private sends and Tor following, compiled and run
       # on their own; and private broadcast with the module's flags, Core 31.2 in-process through
       # libbitcoind_c, under Core's own test framework: through a proxy, and through Logos' Tor.
       checks = lib.genAttrs (lib.remove "x86_64-windows" systems) (system:
@@ -67,6 +67,13 @@
             cp -r ${./tests} tests
             $CXX -std=c++17 -Wall -Wextra -Werror -I${pkgs.nlohmann_json}/include -o tor_follow tests/tor_follow_test.cpp
             ./tor_follow > $out
+          '';
+          # resetData()'s directory and aside name, and which init errors read as corruption.
+          reset-data = pkgs.runCommandCC "bitcoind-module-reset-data" { } ''
+            cp -r ${./src} src
+            cp -r ${./tests} tests
+            $CXX -std=c++17 -Wall -Wextra -Werror -o reset_data tests/reset_data_test.cpp
+            ./reset_data > $out
           '';
           private-broadcast = privateBroadcast "proxy";
           private-broadcast-tor = privateBroadcast "tor";

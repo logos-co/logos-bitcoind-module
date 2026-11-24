@@ -55,7 +55,7 @@ public:
     ///   "tipAgeSecs": number, "sizeOnDisk": number, "dbcacheMiB": number,
     ///   "privateSends": "on|proxy|off|unavailable|waiting|restart|", "privateSendsReason": string,
     ///   "privateSendsCarried": number, "privateSendsCarryIgnored": number,
-    ///   "privateSendsCarryError": string }
+    ///   "privateSendsCarryError": string, "dataCorrupt": bool }
     /// @endcode
     /// Never waits on the node: a thread samples it every second and this serves the last
     /// sample. Numbers are -1 until known. `privateSends` is what the running node does with its
@@ -63,7 +63,8 @@ public:
     /// while an automatic restart to Tor's new port is pending or under way. The reason says why
     /// for unavailable, waiting and restart. The carry fields count the pending private
     /// broadcasts the last automatic restart sent again, or found mined or spent, and say why
-    /// any could not be.
+    /// any could not be. `dataCorrupt` is true when a start failed on a chain Core cannot read
+    /// (lastError names a corrupted database or index); resetData() is the way out.
     LogosMap status();
 
     /// One call into Core's RPC table, in-process. `paramsJson` is a JSON array or object
@@ -71,6 +72,12 @@ public:
     /// {"result":null,"error":{"code":n,"message":s}}. Open to every caller, for the allowlisted
     /// methods only; on regtest also generatetoaddress and generateblock.
     std::string rpc(const std::string& method, const std::string& paramsJson);
+
+    /// Move `network`'s chain aside, so its next start syncs from scratch: the module's own
+    /// dataDir for it, or Core's subdirectory for the network in a dataDir set by hand. Nothing is
+    /// deleted, and the settings stay. Refused while a node runs, and for mainnet in a dataDir set
+    /// by hand. Returns {"movedTo": path}, "" when there was nothing to move.
+    StdLogosResult resetData(const std::string& network);
 
     /// The last `lines` lines of the node's debug.log.
     std::string logTail(int64_t lines);
