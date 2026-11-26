@@ -33,7 +33,7 @@
     {
       packages = lib.genAttrs systems (system: module.packages.${system});
       # rpc()'s allowlist, resetData()'s choice of directory, and the pure halves of private sends and Tor following, compiled and run
-      # on their own; and private broadcast with the module's flags, Core 31.2 in-process through
+      # on their own; and private broadcast with the module's flags, Core 31.3 in-process through
       # libbitcoind_c, under Core's own test framework: through a proxy, and through Logos' Tor.
       checks = lib.genAttrs (lib.remove "x86_64-windows" systems) (system:
         let

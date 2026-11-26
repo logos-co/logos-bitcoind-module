@@ -1,7 +1,7 @@
 # logos-bitcoind-module
 
 `bitcoind_module` runs a Bitcoin full node, [Bitcoin Core](https://github.com/bitcoin/bitcoin)
-31.2, **in-process**, through `libbitcoind_c` from `logos-bitcoin-core-nix`. No executable is
+31.3, **in-process**, through `libbitcoind_c` from `logos-bitcoin-core-nix`. No executable is
 bundled and no subprocess is spawned: the node lives and dies with this module. The Bitcoin
 wallet reaches it over Logos IPC, through `rpc()`, rather than through a port.
 
@@ -114,27 +114,27 @@ The node runs with `-privatebroadcast` in two cases:
 - **Through the user's proxy**, `proxy` set: `-proxy` and `-onlynet=onion`, so every connection
   goes through the proxy to onion services.
 
-What Bitcoin Core 31.2 does with it, from its source at the v31.2 tag (241537a):
+What Bitcoin Core 31.3 does with it, from its source at the v31.3 tag (107ecee):
 
 - `sendrawtransaction` leaves the transaction out of the node's mempool and hands it to private
   broadcast (`rpc/mempool.cpp:130`, `node/transaction.cpp:105`). Core's own wallet is not
   covered (`-privatebroadcast`'s help, `init.cpp:687`); the module runs with `-disablewallet`.
 - Each transaction gets 3 new connections (`NUM_PRIVATE_BROADCAST_PER_TX`,
-  `net_processing.cpp:201`, `:2275`), each to a random address of a reachable privacy network:
+  `net_processing.cpp:203`, `:2279`), each to a random address of a reachable privacy network:
   onion services, IPv4 or IPv6 through Tor's proxy when those are reachable, or I2P
   (`net.cpp:3102`). With `-onlynet=onion` only onion services are reachable, so all three go to
   onion services through the proxy, each on its own circuit (`-proxyrandomize`, on by default;
   Core warns when it is off, `init.cpp:2280`).
 - On such a connection the version message says nothing of the node: services 0, time 0, height
   0, no relay, empty addresses, and a fixed user agent, `/pynode:0.0.1/`, not Core's
-  (`net_processing.cpp:1557`). The peer gets `inv`, then the transaction when it asks, and the
-  connection closes; none lasts more than 3 minutes (`net_processing.cpp:203`, `:5758`).
+  (`net_processing.cpp:1561`). The peer gets `inv`, then the transaction when it asks, and the
+  connection closes; none lasts more than 3 minutes (`net_processing.cpp:205`, `:5767`).
 - The node's existing connections are not told while the broadcast is private: the transaction
   isn't in the mempool, so nothing announces it. Once the node hears it back from the network it
-  stops the private attempts (`net_processing.cpp:4504`) and relays it as any transaction.
-- A transaction not heard back in time goes out privately again (`net_processing.cpp:1658`).
+  stops the private attempts (`net_processing.cpp:4513`) and relays it as any transaction.
+- A transaction not heard back in time goes out privately again (`net_processing.cpp:1662`).
 - At most 10,000 transactions wait to be heard back; past that, new ones are refused
-  (`private_broadcast.h:44`, `net_processing.cpp:2282`, new in 31.2).
+  (`private_broadcast.h:44`, `net_processing.cpp:2286`, new in 31.2).
 - Core refuses to start with `-privatebroadcast` when neither Tor nor I2P is reachable, or with
   `-connect` (`init.cpp:2264`). The 31.1 release notes fix a leak in 31.0, where some of these
   connections were made over clearnet instead of the privacy network (#35410, the proxy kept on a
@@ -145,7 +145,7 @@ hears it from the node first; nothing in the feature hides that a transaction wa
 some Tor user, or protects a transaction sent another way.
 
 `tests/private_broadcast_test.py` checks it with the module's own flags (`tests/print_argv` prints
-them), Core 31.2 in-process through libbitcoind_c, under Core's own test framework, as Core's
+them), Core 31.3 in-process through libbitcoind_c, under Core's own test framework, as Core's
 `p2p_private_broadcast.py` does: a SOCKS5 proxy routes the first private broadcast connection to a
 second regtest node and every other connection to a Python peer that records what it hears, the
 `-addnode` peer included (BIP324 or v1, as the node opens). The transaction stays out of the
@@ -158,7 +158,7 @@ it (about a minute); `private-broadcast-tor` runs the same with Logos' Tor's fla
 ### Private sends through Logos' Tor
 
 With `privateSends` and no `proxy`, a start asks `tor_module` for its SOCKS port and passes
-`-onion=IP:PORT -privatebroadcast`. What Core 31.2 does with that, from the same source:
+`-onion=IP:PORT -privatebroadcast`. What Core 31.3 does with that, from the same source:
 
 - `-onion` alone gives onion services a proxy and keeps them reachable (`init.cpp:1768`, `:1792`).
   IPv4 and IPv6 stay reachable with no proxy: only `-proxy` sets theirs (`init.cpp:1707`). So the
@@ -238,7 +238,7 @@ then or later, and again after it reloads. Only the `socks` field matters here.
   carry-over, with counts and reasons, never a transaction.
 
 **What a restart costs.** Core keeps transactions waiting for private broadcast in memory only:
-`PeerManagerImpl::m_tx_for_private_broadcast` (`net_processing.cpp:1096`), a map in
+`PeerManagerImpl::m_tx_for_private_broadcast` (`net_processing.cpp:1100`), a map in
 `PrivateBroadcast` (`private_broadcast.h:216`), outside the mempool and never on disk. A stop
 forgets them, and with `-privatebroadcast` the wallet's `requested` send reaches the network only
 through that queue. A send made just before the port moved has had its connections fail at the
@@ -263,7 +263,7 @@ This covers the module's own automatic restart only. A send pending when the use
 node, when the module unloads, or when the node crashes, is still lost: Core keeps no copy, and
 neither does the module.
 
-`tests/private_broadcast_test.py --mode tor` checks what this relies on against Core 31.2: after
+`tests/private_broadcast_test.py --mode tor` checks what this relies on against Core 31.3: after
 a restart `getprivatebroadcastinfo` is empty, the same hex is taken again and queued privately,
 and once mined it answers -27, once its inputs are spent -25.
 
